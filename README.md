@@ -16,6 +16,7 @@ robotics-facing data pipeline.
 - `lsm6dsox_ros/`: ROS 2 Humble C++ publisher for `/imu/data`.
 - `scripts/`: IIO buffer enable/disable helpers for the board runtime.
 - `config/udev/`: persistent non-root IIO device access rule.
+- `systemd/`: manual-start ROS 2 service with failure recovery.
 - `docs/validation.md`: hardware and ROS 2 validation summary.
 - `docs/modprobe-deployment.md`: module installation, `modprobe`, and
   boot-time auto-load validation.
@@ -97,6 +98,9 @@ Override the default 128-frame kernel buffer if needed:
 ```sh
 BUFFER_LENGTH=256 ./scripts/enable_lsm6dsox_buffer.sh
 ```
+
+For a manually controlled service that restarts the ROS 2 node after failures,
+see `docs/systemd-deployment.md`. It is deliberately not enabled at boot.
 
 Raw buffered frame test:
 

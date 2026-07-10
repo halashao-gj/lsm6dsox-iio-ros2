@@ -1,0 +1,24 @@
+[Unit]
+Description=LSM6DSOX ROS 2 IMU publisher
+Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=cat
+WorkingDirectory=/home/cat/ros2_ws
+
+# The buffer scripts write privileged IIO sysfs attributes. The '+' prefix lets
+# these setup and cleanup commands run as root while the ROS node runs as cat.
+ExecStartPre=+/home/cat/ros2_ws/src/lsm6dsox_ros/scripts/enable_lsm6dsox_buffer.sh
+ExecStart=/home/cat/ros2_ws/src/lsm6dsox_ros/scripts/run_lsm6dsox_ros.sh
+ExecStopPost=+/home/cat/ros2_ws/src/lsm6dsox_ros/scripts/disable_lsm6dsox_buffer.sh
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
