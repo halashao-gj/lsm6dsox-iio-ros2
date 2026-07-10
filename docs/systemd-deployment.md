@@ -41,10 +41,11 @@ ros2 topic hz /imu/data
 
 ## Runtime Behavior
 
-On each start, systemd enables the IIO buffer as root, then launches ROS 2 as
-the `cat` user. The udev deployment grants `cat` read access to the IIO device.
-On an unexpected ROS 2 process failure, systemd runs the buffer cleanup step,
-waits two seconds, then enables the buffer and starts the node again.
+On each start, systemd enables the IIO buffer as root, then runs
+`imu_publisher` directly as the `cat` user. The udev deployment grants `cat`
+read access to the IIO device. Running the executable directly makes its exit
+code visible to systemd, so an unexpected node failure runs the buffer cleanup
+step, waits two seconds, then enables the buffer and starts the node again.
 
 An explicit `systemctl stop` is treated as a normal stop and does not restart
 the service. The cleanup step disables the IIO buffer in both cases.
@@ -56,10 +57,14 @@ Validated on the RK3576 LubanCat with systemd 249:
 ```text
 systemctl is-enabled lsm6dsox-ros.service -> disabled
 systemctl start -> active (running)
-SIGKILL of the main launch process -> automatic restart after 2 seconds
+SIGKILL of the main imu_publisher process -> automatic restart after 2 seconds
 systemctl stop -> inactive and IIO buffer=0
 ```
 
 The service process runs as `cat`, including membership in the `iio` group, and
 the setup/cleanup scripts run with the elevated privileges required for IIO
 sysfs writes.
+
+The service was changed to run `imu_publisher` directly after testing showed
+that a `ros2 launch` parent can exit normally when its child crashes. Direct
+execution preserves the node failure status for `Restart=on-failure`.
