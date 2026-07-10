@@ -15,6 +15,8 @@ robotics-facing data pipeline.
 - `IIO-raw/`: small userspace reader for `/dev/iio:deviceX` buffered frames.
 - `lsm6dsox_ros/`: ROS 2 Humble C++ publisher for `/imu/data`.
 - `docs/validation.md`: hardware and ROS 2 validation summary.
+- `docs/modprobe-deployment.md`: module installation, `modprobe`, and
+  boot-time auto-load validation.
 
 ## Implemented features
 
@@ -42,6 +44,7 @@ Observed validation results:
 - Static acceleration magnitude measured around `9.93 m/s^2`.
 - `/imu/data` published at about `49.99 Hz` in the earlier sysfs polling node.
 - IIO triggered buffer successfully produced 24-byte frames from `/dev/iio:device1`.
+- `modprobe` deployment and boot-time auto-loading validated.
 - Madgwick filter and rosbag recording were validated on the board.
 
 ## Build

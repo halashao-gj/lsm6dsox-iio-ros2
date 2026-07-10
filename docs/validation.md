@@ -94,3 +94,16 @@ linear_acceleration:
 
 The pipeline was also connected to `imu_filter_madgwick`, producing
 `/imu/data_filtered`, and recorded with rosbag for replay validation.
+
+## modprobe Deployment
+
+On 2026-07-10, the driver was installed into the board module tree:
+
+```text
+/lib/modules/6.1.99-rk3576/extra/lsm6dsox_driver.ko
+```
+
+`depmod -a`, `modprobe lsm6dsox_driver`, and boot-time loading through
+`/etc/modules-load.d/lsm6dsox.conf` were validated. After reboot, the module
+auto-loaded, probed `7-006a`, registered the IIO device, and produced 48 bytes
+from `/dev/iio:device1`, matching two 24-byte buffered scan frames.
