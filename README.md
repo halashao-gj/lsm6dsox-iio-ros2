@@ -17,6 +17,8 @@ robotics-facing data pipeline.
 - `docs/validation.md`: hardware and ROS 2 validation summary.
 - `docs/modprobe-deployment.md`: module installation, `modprobe`, and
   boot-time auto-load validation.
+- `docs/ros2-buffer-validation.md`: ROS 2 validation using `/dev/iio:device1`
+  buffered frames.
 
 ## Implemented features
 
@@ -45,6 +47,8 @@ Observed validation results:
 - `/imu/data` published at about `49.99 Hz` in the earlier sysfs polling node.
 - IIO triggered buffer successfully produced 24-byte frames from `/dev/iio:device1`.
 - `modprobe` deployment and boot-time auto-loading validated.
+- ROS 2 publisher directly consumed `/dev/iio:device1` buffered frames and
+  published `/imu/data` at about `102.5 Hz`.
 - Madgwick filter and rosbag recording were validated on the board.
 
 ## Build
@@ -69,6 +73,8 @@ colcon build --packages-select lsm6dsox_ros
 Install the device tree overlay as described in
 `lsm6dsox_minimal/README.md`, load `lsm6dsox_driver.ko`, then enable the IIO
 buffer or start the ROS 2 node.
+
+The ROS 2 node expects the IIO buffer to be enabled before launch.
 
 ```sh
 source /opt/ros/humble/setup.bash

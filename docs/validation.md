@@ -95,6 +95,36 @@ linear_acceleration:
 The pipeline was also connected to `imu_filter_madgwick`, producing
 `/imu/data_filtered`, and recorded with rosbag for replay validation.
 
+## ROS 2 Direct IIO Buffer Path
+
+On 2026-07-10 host time, the ROS 2 node was synced to the LubanCat board and
+rebuilt from a clean package build. The node opened `/dev/iio:device1` and read
+24-byte buffered frames using `poll()`.
+
+Observed node log:
+
+```text
+reading buffered IIO frames from /dev/iio:device1 (sysfs: /sys/bus/iio/devices/iio:device1)
+accel_scale=0.000598205 gyro_scale=0.000152716
+```
+
+Observed ROS 2 output:
+
+```text
+/imu/data average rate: about 102.5 Hz
+linear_acceleration.z: about 9.97 m/s^2
+```
+
+Recorded rosbag:
+
+```text
+/home/cat/bags/lsm6dsox_iio_buffer_20260606_002822
+Duration: 6.053645111s
+Messages: 622
+Topic: /imu/data
+Type: sensor_msgs/msg/Imu
+```
+
 ## modprobe Deployment
 
 On 2026-07-10, the driver was installed into the board module tree:
