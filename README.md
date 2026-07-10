@@ -14,6 +14,7 @@ robotics-facing data pipeline.
 - `lsm6dsox_driver/`: out-of-tree Linux I2C/IIO driver.
 - `IIO-raw/`: small userspace reader for `/dev/iio:deviceX` buffered frames.
 - `lsm6dsox_ros/`: ROS 2 Humble C++ publisher for `/imu/data`.
+- `scripts/`: IIO buffer enable/disable helpers for the board runtime.
 - `docs/validation.md`: hardware and ROS 2 validation summary.
 - `docs/modprobe-deployment.md`: module installation, `modprobe`, and
   boot-time auto-load validation.
@@ -72,14 +73,27 @@ colcon build --packages-select lsm6dsox_ros
 
 Install the device tree overlay as described in
 `lsm6dsox_minimal/README.md`, load `lsm6dsox_driver.ko`, then enable the IIO
-buffer or start the ROS 2 node.
+buffer before starting the ROS 2 node.
 
-The ROS 2 node expects the IIO buffer to be enabled before launch.
+Run these commands from the repository root on the board. The helper finds the
+`name=lsm6dsox` IIO device and its matching trigger automatically. It uses
+`sudo` to write sysfs settings and temporarily grants read permission to the
+IIO character device for the current ROS 2 launch.
 
 ```sh
+./scripts/enable_lsm6dsox_buffer.sh
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch lsm6dsox_ros imu.launch.py
+
+# After stopping the ROS 2 node
+./scripts/disable_lsm6dsox_buffer.sh
+```
+
+Override the default 128-frame kernel buffer if needed:
+
+```sh
+BUFFER_LENGTH=256 ./scripts/enable_lsm6dsox_buffer.sh
 ```
 
 Raw buffered frame test:
