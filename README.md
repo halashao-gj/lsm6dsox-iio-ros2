@@ -26,6 +26,8 @@ robotics-facing data pipeline.
   lifecycle fix, and interview-oriented troubleshooting notes.
 - `docs/imu-calibration.md`: stationary gyro-bias capture, covariance
   parameters, and frame configuration.
+- `docs/regmap-refactor.md`: rationale, migration mapping, and validation for
+  the driver register-access refactor.
 
 ## Implemented features
 

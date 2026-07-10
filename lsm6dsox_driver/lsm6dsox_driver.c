@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/regmap.h>
 #include <linux/atomic.h>
 #include <linux/interrupt.h>
 #include <linux/string.h>
@@ -68,6 +69,7 @@ static const struct lsm6dsox_odr_entry lsm6dsox_odr_table[] = {
 
 struct lsm6dsox_data {
 	struct i2c_client *client;
+	struct regmap *regmap;
 	struct iio_trigger *trig;
 	struct mutex lock;
 	int accel_odr;
@@ -86,8 +88,16 @@ struct lsm6dsox_scan {
 	s64 timestamp;
 } __aligned(8);
 
-static int lsm6dsox_read_xyz(struct i2c_client *client, u8 start_reg,
+static int lsm6dsox_read_xyz(struct lsm6dsox_data *data, u8 start_reg,
 			     s16 *x, s16 *y, s16 *z);
+
+static const struct regmap_config lsm6dsox_regmap_config = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.max_register = LSM6DSOX_REG_OUTX_L_A + 5,
+	/* A sensor reset changes hardware registers behind regmap's back. */
+	.cache_type = REGCACHE_NONE,
+};
 
 static const struct iio_chan_spec lsm6dsox_channels[] = {
 	{
@@ -220,12 +230,12 @@ static irqreturn_t lsm6dsox_trigger_handler(int irq, void *p)
 
 	memset(&scan, 0, sizeof(scan));
 
-	ret = lsm6dsox_read_xyz(data->client, LSM6DSOX_REG_OUTX_L_A,
+	ret = lsm6dsox_read_xyz(data, LSM6DSOX_REG_OUTX_L_A,
 				&ax, &ay, &az);
 	if (ret < 0)
 		goto done;
 
-	ret = lsm6dsox_read_xyz(data->client, LSM6DSOX_REG_OUTX_L_G,
+	ret = lsm6dsox_read_xyz(data, LSM6DSOX_REG_OUTX_L_G,
 				&gx, &gy, &gz);
 	if (ret < 0)
 		goto done;
@@ -255,32 +265,31 @@ static int lsm6dsox_validate_trigger(struct iio_dev *indio_dev,
 	return data->trig == trig ? 0 : -EINVAL;
 }
 
-static int lsm6dsox_write_int1_ctrl(struct i2c_client *client, u8 value,
+static int lsm6dsox_write_int1_ctrl(struct lsm6dsox_data *data, u8 value,
 					    const char *operation)
 {
 	int attempt;
 	int ret = 0;
 
 	for (attempt = 0; attempt < LSM6DSOX_INT1_RETRIES; attempt++) {
-		ret = i2c_smbus_write_byte_data(client, LSM6DSOX_REG_INT1_CTRL,
-						       value);
-		if (ret >= 0)
+		ret = regmap_write(data->regmap, LSM6DSOX_REG_INT1_CTRL, value);
+		if (!ret)
 			return 0;
 
 		if (attempt + 1 < LSM6DSOX_INT1_RETRIES)
 			msleep(LSM6DSOX_INT1_RETRY_DELAY_MS);
 	}
 
-	dev_err(&client->dev, "failed to %s INT1_CTRL after %d attempts: %d\n",
+	dev_err(&data->client->dev, "failed to %s INT1_CTRL after %d attempts: %d\n",
 		operation, LSM6DSOX_INT1_RETRIES, ret);
 	return ret;
 }
 
-static int lsm6dsox_config_int1_drdy(struct i2c_client *client)
+static int lsm6dsox_config_int1_drdy(struct lsm6dsox_data *data)
 {
 	int ret;
 
-	ret = lsm6dsox_write_int1_ctrl(client,
+	ret = lsm6dsox_write_int1_ctrl(data,
 					 LSM6DSOX_INT1_DRDY_XL,
 					 "enable");
 	if (ret < 0)
@@ -291,19 +300,19 @@ static int lsm6dsox_config_int1_drdy(struct i2c_client *client)
 	 * of both data sets; routing both sources to an edge-triggered GPIO can
 	 * produce back-to-back edges and leave the shared line in the wrong state.
 	 */
-	dev_info(&client->dev, "INT1 accel data-ready interrupt enabled\n");
+	dev_info(&data->client->dev, "INT1 accel data-ready interrupt enabled\n");
 	return 0;
 }
 
-static int lsm6dsox_disable_int1_drdy(struct i2c_client *client)
+static int lsm6dsox_disable_int1_drdy(struct lsm6dsox_data *data)
 {
 	int ret;
 
-	ret = lsm6dsox_write_int1_ctrl(client, 0, "disable");
+	ret = lsm6dsox_write_int1_ctrl(data, 0, "disable");
 	if (ret < 0)
 		return ret;
 
-	dev_info(&client->dev, "INT1 data-ready interrupt disabled\n");
+	dev_info(&data->client->dev, "INT1 data-ready interrupt disabled\n");
 	return 0;
 }
 
@@ -331,7 +340,7 @@ static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 	if (!data->buffer_enabled) {
 		atomic_set(&data->irq_count, 0);
 		atomic_set(&data->sample_count, 0);
-		ret = lsm6dsox_config_int1_drdy(data->client);
+		ret = lsm6dsox_config_int1_drdy(data);
 		if (!ret)
 			data->buffer_enabled = true;
 	}
@@ -347,7 +356,7 @@ static int lsm6dsox_buffer_predisable(struct iio_dev *indio_dev)
 
 	mutex_lock(&data->lock);
 	if (data->buffer_enabled) {
-		ret = lsm6dsox_disable_int1_drdy(data->client);
+		ret = lsm6dsox_disable_int1_drdy(data);
 		/*
 		 * Teardown must not poison the next enable cycle.  The hardware state
 		 * is unknown after an I2C error, so force postenable() to reprogram it.
@@ -369,161 +378,137 @@ static const struct iio_buffer_setup_ops lsm6dsox_buffer_ops = {
 	.predisable = lsm6dsox_buffer_predisable,
 };
 
-static int lsm6dsox_soft_reset(struct i2c_client *client)
+static int lsm6dsox_soft_reset(struct lsm6dsox_data *data)
 {
-	int value;
+	unsigned int value;
 	int ret;
 
-	value = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_CTRL3_C);
-	if (value < 0) {
-		dev_err(&client->dev, "failed to read CTRL3_C: %d\n", value);
-		return value;
-	}
-
-	dev_info(&client->dev, "CTRL3_C=0x%02x\n", value);
-
-	ret = i2c_smbus_write_byte_data(client, LSM6DSOX_REG_CTRL3_C,
-					 value | LSM6DSOX_SW_RESET);
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_CTRL3_C, &value);
 	if (ret < 0) {
-		dev_err(&client->dev, "failed to write CTRL3_C: %d\n", ret);
+		dev_err(&data->client->dev, "failed to read CTRL3_C: %d\n", ret);
 		return ret;
 	}
 
-	dev_info(&client->dev, "successfully started software reset\n");
+	dev_info(&data->client->dev, "CTRL3_C=0x%02x\n", value);
+
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL3_C,
+				 LSM6DSOX_SW_RESET, LSM6DSOX_SW_RESET);
+	if (ret < 0) {
+		dev_err(&data->client->dev, "failed to write CTRL3_C: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(&data->client->dev, "successfully started software reset\n");
 	msleep(LSM6DSOX_RESET_DELAY_MS);
 
-	value = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_CTRL3_C);
-	if (value < 0) {
-		dev_err(&client->dev, "failed to read CTRL3_C: %d\n", value);
-		return value;
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_CTRL3_C, &value);
+	if (ret < 0) {
+		dev_err(&data->client->dev, "failed to read CTRL3_C: %d\n", ret);
+		return ret;
 	}
 
 	if (value & LSM6DSOX_SW_RESET) {
-		dev_err(&client->dev, "software reset did not complete\n");
+		dev_err(&data->client->dev, "software reset did not complete\n");
 		return -ETIMEDOUT;
 	}
 
-	dev_info(&client->dev,
+	dev_info(&data->client->dev,
 		 "software reset complete, CTRL3_C=0x%02x\n", value);
 	return 0;
 }
 
-static int lsm6dsox_enable_bdu(struct i2c_client *client)
+static int lsm6dsox_enable_bdu(struct lsm6dsox_data *data)
 {
-	int value;
+	unsigned int value;
 	int ret;
 
-	value = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_CTRL3_C);
-	if (value < 0) {
-		dev_err(&client->dev, "failed to read CTRL3_C: %d\n", value);
-		return value;
-	}
-
-	ret = i2c_smbus_write_byte_data(client, LSM6DSOX_REG_CTRL3_C,
-					 value | LSM6DSOX_BDU);
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL3_C,
+				 LSM6DSOX_BDU, LSM6DSOX_BDU);
 	if (ret < 0) {
-		dev_err(&client->dev, "failed to write CTRL3_C: %d\n", ret);
+		dev_err(&data->client->dev, "failed to write CTRL3_C: %d\n", ret);
 		return ret;
 	}
 
-	value = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_CTRL3_C);
-	if (value < 0) {
-		dev_err(&client->dev, "failed to read CTRL3_C: %d\n", value);
-		return value;
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_CTRL3_C, &value);
+	if (ret < 0) {
+		dev_err(&data->client->dev, "failed to read CTRL3_C: %d\n", ret);
+		return ret;
 	}
 
 	if (!(value & LSM6DSOX_BDU)) {
-		dev_err(&client->dev, "failed to enable BDU\n");
+		dev_err(&data->client->dev, "failed to enable BDU\n");
 		return -EIO;
 	}
 
-	dev_info(&client->dev, "BDU enabled, CTRL3_C=0x%02x\n", value);
+	dev_info(&data->client->dev, "BDU enabled, CTRL3_C=0x%02x\n", value);
 	return 0;
 }
 
-static int lsm6dsox_config_accel(struct i2c_client *client)
+static int lsm6dsox_config_accel(struct lsm6dsox_data *data)
 {
 	const int config_mask = LSM6DSOX_ODR_XL_MASK |
 				LSM6DSOX_FS_XL_MASK;
 	const int config_value = LSM6DSOX_ODR_XL_104HZ |
 				 LSM6DSOX_FS_XL_2G;
-	int value;
+	unsigned int value;
 	int ret;
 
-	value = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_CTRL1_XL);
-	if (value < 0) {
-		dev_err(&client->dev, "failed to read CTRL1_XL: %d\n", value);
-		return value;
-	}
-
-	value &= ~config_mask;
-	value |= config_value;
-
-	ret = i2c_smbus_write_byte_data(client, LSM6DSOX_REG_CTRL1_XL,
-					 value);
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL1_XL,
+				 config_mask, config_value);
 	if (ret < 0) {
-		dev_err(&client->dev, "failed to write CTRL1_XL: %d\n", ret);
+		dev_err(&data->client->dev, "failed to write CTRL1_XL: %d\n", ret);
 		return ret;
 	}
 
-	value = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_CTRL1_XL);
-	if (value < 0) {
-		dev_err(&client->dev, "failed to read CTRL1_XL: %d\n", value);
-		return value;
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_CTRL1_XL, &value);
+	if (ret < 0) {
+		dev_err(&data->client->dev, "failed to read CTRL1_XL: %d\n", ret);
+		return ret;
 	}
 
 	if ((value & config_mask) != config_value) {
-		dev_err(&client->dev,
+		dev_err(&data->client->dev,
 			"failed to configure accelerometer, CTRL1_XL=0x%02x\n",
 			value);
 		return -EIO;
 	}
 
-	dev_info(&client->dev,
+	dev_info(&data->client->dev,
 		 "accelerometer configured, CTRL1_XL=0x%02x\n", value);
 	return 0;
 }
 
-static int lsm6dsox_config_gyro(struct i2c_client *client)
+static int lsm6dsox_config_gyro(struct lsm6dsox_data *data)
 {
 	const int config_mask = LSM6DSOX_ODR_G_MASK |
 				LSM6DSOX_FS_G_MASK |
 				LSM6DSOX_FS_125_MASK;
 	const int config_value = LSM6DSOX_ODR_G_104HZ |
 				 LSM6DSOX_FS_G_250DPS;
-	int value;
+	unsigned int value;
 	int ret;
 
-	value = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_CTRL2_G);
-	if (value < 0) {
-		dev_err(&client->dev, "failed to read CTRL2_G: %d\n", value);
-		return value;
-	}
-
-	value &= ~config_mask;
-	value |= config_value;
-
-	ret = i2c_smbus_write_byte_data(client, LSM6DSOX_REG_CTRL2_G,
-					 value);
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL2_G,
+				 config_mask, config_value);
 	if (ret < 0) {
-		dev_err(&client->dev, "failed to write CTRL2_G: %d\n", ret);
+		dev_err(&data->client->dev, "failed to write CTRL2_G: %d\n", ret);
 		return ret;
 	}
 
-	value = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_CTRL2_G);
-	if (value < 0) {
-		dev_err(&client->dev, "failed to read CTRL2_G: %d\n", value);
-		return value;
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_CTRL2_G, &value);
+	if (ret < 0) {
+		dev_err(&data->client->dev, "failed to read CTRL2_G: %d\n", ret);
+		return ret;
 	}
 
 	if ((value & config_mask) != config_value) {
-		dev_err(&client->dev,
+		dev_err(&data->client->dev,
 			"failed to configure gyroscope, CTRL2_G=0x%02x\n",
 			value);
 		return -EIO;
 	}
 
-	dev_info(&client->dev,
+	dev_info(&data->client->dev,
 		 "gyroscope configured, CTRL2_G=0x%02x\n", value);
 	return 0;
 }
@@ -534,7 +519,7 @@ static int lsm6dsox_set_odr(struct lsm6dsox_data *data,
 	const struct lsm6dsox_odr_entry *odr = NULL;
 	int reg;
 	int mask;
-	int value;
+	unsigned int value;
 	int ret;
 	size_t i;
 
@@ -561,20 +546,13 @@ static int lsm6dsox_set_odr(struct lsm6dsox_data *data,
 		return -EINVAL;
 	}
 
-	value = i2c_smbus_read_byte_data(client, reg);
-	if (value < 0)
-		return value;
-
-	value &= ~mask;
-	value |= odr->value;
-
-	ret = i2c_smbus_write_byte_data(client, reg, value);
+	ret = regmap_update_bits(data->regmap, reg, mask, odr->value);
 	if (ret < 0)
 		return ret;
 
-	value = i2c_smbus_read_byte_data(client, reg);
-	if (value < 0)
-		return value;
+	ret = regmap_read(data->regmap, reg, &value);
+	if (ret < 0)
+		return ret;
 
 	if ((value & mask) != odr->value) {
 		dev_err(&client->dev,
@@ -595,31 +573,23 @@ static int lsm6dsox_set_odr(struct lsm6dsox_data *data,
 	return 0;
 }
 
-static int lsm6dsox_read_xyz(struct i2c_client *client, u8 start_reg,
+static int lsm6dsox_read_xyz(struct lsm6dsox_data *data, u8 start_reg,
 			     s16 *x, s16 *y, s16 *z)
 {
-	u8 data[6];
+	u8 raw[6];
 	int ret;
 
-	ret = i2c_smbus_read_i2c_block_data(client, start_reg,
-					    sizeof(data), data);
+	ret = regmap_bulk_read(data->regmap, start_reg, raw, sizeof(raw));
 	if (ret < 0) {
-		dev_err(&client->dev,
+		dev_err(&data->client->dev,
 			"failed to read XYZ block at 0x%02x: %d\n",
 			start_reg, ret);
 		return ret;
 	}
 
-	if (ret != sizeof(data)) {
-		dev_err(&client->dev,
-			"short XYZ read at 0x%02x: got %d bytes\n",
-			start_reg, ret);
-		return -EIO;
-	}
-
-	*x = (s16)(((u16)data[1] << 8) | data[0]);
-	*y = (s16)(((u16)data[3] << 8) | data[2]);
-	*z = (s16)(((u16)data[5] << 8) | data[4]);
+	*x = (s16)(((u16)raw[1] << 8) | raw[0]);
+	*y = (s16)(((u16)raw[3] << 8) | raw[2]);
+	*z = (s16)(((u16)raw[5] << 8) | raw[4]);
 
 	return 0;
 }
@@ -634,21 +604,13 @@ static int lsm6dsox_read_raw(struct iio_dev *indio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
-		ret = i2c_smbus_read_i2c_block_data(data->client,
-						chan->address,
-						sizeof(raw), raw);
+		ret = regmap_bulk_read(data->regmap, chan->address,
+					       raw, sizeof(raw));
 		if (ret < 0) {
 			dev_err(&data->client->dev,
 				"failed to read raw channel at 0x%02lx: %d\n",
 				chan->address, ret);
 			return ret;
-		}
-
-		if (ret != sizeof(raw)) {
-			dev_err(&data->client->dev,
-				"short raw read at 0x%02lx: got %d bytes\n",
-				chan->address, ret);
-			return -EIO;
 		}
 
 		/* Samples are signed 16-bit values stored low byte first. */
@@ -714,65 +676,17 @@ static int lsm6dsox_probe(struct i2c_client *client)
 	struct iio_dev *indio_dev;
 	s16 ax, ay, az;
 	s16 gx, gy, gz;
+	unsigned int whoami;
 	int ret;
 
 	dev_info(&client->dev, "my probe entered, addr=0x%02x\n",
 		 client->addr);
 
-	if (!i2c_check_functionality(client->adapter,
-				     I2C_FUNC_SMBUS_BYTE_DATA |
-				     I2C_FUNC_SMBUS_I2C_BLOCK)) {
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
 		dev_err(&client->dev,
-			"adapter lacks required SMBus byte/block access\n");
+			"adapter lacks required I2C transfer support\n");
 		return -EOPNOTSUPP;
 	}
-
-	ret = i2c_smbus_read_byte_data(client, LSM6DSOX_REG_WHO_AM_I);
-	if (ret < 0) {
-		dev_err(&client->dev, "failed to read WHO_AM_I: %d\n", ret);
-		return ret;
-	}
-
-	if (ret != LSM6DSOX_WHO_AM_I_VALUE) {
-		dev_err(&client->dev,
-			"unexpected WHO_AM_I: got 0x%02x, expected 0x%02x\n",
-			ret, LSM6DSOX_WHO_AM_I_VALUE);
-		return -ENODEV;
-	}
-
-	dev_info(&client->dev, "WHO_AM_I=0x%02x\n", ret);
-
-	ret = lsm6dsox_soft_reset(client);
-	if (ret < 0)
-		return ret;
-
-	ret = lsm6dsox_enable_bdu(client);
-	if (ret < 0)
-		return ret;
-
-	ret = lsm6dsox_config_accel(client);
-	if (ret < 0)
-		return ret;
-
-	ret = lsm6dsox_config_gyro(client);
-	if (ret < 0)
-		return ret;
-
-	msleep(LSM6DSOX_STARTUP_DELAY_MS);
-
-	ret = lsm6dsox_read_xyz(client, LSM6DSOX_REG_OUTX_L_A,
-				&ax, &ay, &az);
-	if (ret < 0)
-		return ret;
-
-	dev_info(&client->dev, "accel raw: x=%d y=%d z=%d\n", ax, ay, az);
-
-	ret = lsm6dsox_read_xyz(client, LSM6DSOX_REG_OUTX_L_G,
-				&gx, &gy, &gz);
-	if (ret < 0)
-		return ret;
-
-	dev_info(&client->dev, "gyro raw: x=%d y=%d z=%d\n", gx, gy, gz);
 
 	indio_dev = devm_iio_device_alloc(&client->dev, sizeof(*data));
 	if (!indio_dev)
@@ -780,6 +694,60 @@ static int lsm6dsox_probe(struct i2c_client *client)
 
 	data = iio_priv(indio_dev);
 	data->client = client;
+	data->regmap = devm_regmap_init_i2c(client, &lsm6dsox_regmap_config);
+	if (IS_ERR(data->regmap)) {
+		ret = PTR_ERR(data->regmap);
+		dev_err(&client->dev, "failed to initialize regmap: %d\n", ret);
+		return ret;
+	}
+
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_WHO_AM_I, &whoami);
+	if (ret < 0) {
+		dev_err(&client->dev, "failed to read WHO_AM_I: %d\n", ret);
+		return ret;
+	}
+
+	if (whoami != LSM6DSOX_WHO_AM_I_VALUE) {
+		dev_err(&client->dev,
+			"unexpected WHO_AM_I: got 0x%02x, expected 0x%02x\n", whoami,
+			LSM6DSOX_WHO_AM_I_VALUE);
+		return -ENODEV;
+	}
+
+	dev_info(&client->dev, "WHO_AM_I=0x%02x\n", whoami);
+
+	ret = lsm6dsox_soft_reset(data);
+	if (ret < 0)
+		return ret;
+
+	ret = lsm6dsox_enable_bdu(data);
+	if (ret < 0)
+		return ret;
+
+	ret = lsm6dsox_config_accel(data);
+	if (ret < 0)
+		return ret;
+
+	ret = lsm6dsox_config_gyro(data);
+	if (ret < 0)
+		return ret;
+
+	msleep(LSM6DSOX_STARTUP_DELAY_MS);
+
+	ret = lsm6dsox_read_xyz(data, LSM6DSOX_REG_OUTX_L_A,
+				&ax, &ay, &az);
+	if (ret < 0)
+		return ret;
+
+	dev_info(&client->dev, "accel raw: x=%d y=%d z=%d\n", ax, ay, az);
+
+	ret = lsm6dsox_read_xyz(data, LSM6DSOX_REG_OUTX_L_G,
+				&gx, &gy, &gz);
+	if (ret < 0)
+		return ret;
+
+	dev_info(&client->dev, "gyro raw: x=%d y=%d z=%d\n", gx, gy, gz);
+
 	mutex_init(&data->lock);
 	data->accel_odr = LSM6DSOX_SAMP_FREQ_HZ;
 	data->gyro_odr = LSM6DSOX_SAMP_FREQ_HZ;
