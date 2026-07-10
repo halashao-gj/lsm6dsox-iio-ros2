@@ -66,7 +66,10 @@ source /opt/ros/humble/setup.bash
 source "$workspace_root/install/setup.bash"
 set -u
 topic_output="$(mktemp)"
-timeout 8 ros2 topic echo --qos-reliability best_effort --once /imu/data >"$topic_output" || true
+# ros2 topic echo is a Python process.  Keep stdout unbuffered because timeout
+# may otherwise terminate it after it received a message but before redirected
+# output reaches the temporary file.
+timeout 8 env PYTHONUNBUFFERED=1 ros2 topic echo --qos-reliability best_effort --once /imu/data >"$topic_output" || true
 cat "$topic_output"
 if ! grep -q '^header:' "$topic_output"; then
   echo '/imu/data was not published within 8 seconds' >&2

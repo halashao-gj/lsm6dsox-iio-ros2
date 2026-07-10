@@ -34,6 +34,11 @@
 disable -> enable 循环又依赖 IIO 内部引用计数；这使硬件 INT1 的实际状态不再和
 buffer 状态一一对应，后续启动可能没有重新使能 INT1。
 
+后续压力测试还发现，初版同时把 accel 和 gyro 的 DRDY 路由到同一个
+edge-triggered INT1。两者配置为相同 ODR，任意一个 accel DRDY 都足以作为读取完整
+accel+gyro scan 的采样点；双路由会产生紧邻的边沿，并偶发使共享 GPIO 的事件状态异常，
+表现为启动后只有 1–2 次 IRQ。最终改为只路由 `DRDY_XL`。
+
 另一个放大问题是，关闭 INT1 的 SMBus 写入曾返回 `-6`（`ENXIO`）。旧代码只在
 写入成功时才清除 `buffer_enabled` 标志。于是软件保留“已经开启”的陈旧状态，下一次
 `postenable` 跳过寄存器配置，导致没有新 IRQ 和用户态帧。
@@ -48,6 +53,8 @@ buffer 状态一一对应，后续启动可能没有重新使能 INT1。
 - 将 INT1 配置与 trigger 选择解耦；`.set_trigger_state()` 不再隐式操作硬件。
 - INT1 SMBus 写入最多重试三次；即使关闭失败，也强制清除软件状态，让下一次
   `postenable` 重新配置硬件。
+- 只将 accel DRDY 路由至 INT1；在相同 ODR 下，它是 accel/gyro scan 的唯一稳定采样
+  时钟。
 - 计数器改为每个设备实例私有，并在首帧入 buffer 时输出调试日志。
 - 在 `remove()` 中释放 trigger 引用，保证正常 `modprobe -r` 生命周期。
 
@@ -62,9 +69,11 @@ buffer 状态一一对应，后续启动可能没有重新使能 INT1。
 脚本依次检查模块和 IIO 设备、停止服务后独占读取一个 24-byte IIO frame、启动服务、
 并以 `BEST_EFFORT` QoS 确认 `/imu/data` 的实际消息内容。不要以
 `ros2 topic echo --once` 的退出码作为唯一标准：在 ROS 2 Humble 中该命令收到消息后
-不一定立即退出，脚本应检查捕获输出是否含有 `header:`。
+不一定立即退出，脚本应检查捕获输出是否含有 `header:`；由于它是 Python 进程，输出
+重定向到文件时还必须设置 `PYTHONUNBUFFERED=1`，否则 `timeout` 可能在缓冲区刷新前
+终止进程并制造假阴性。
 
-部署后在目标板连续运行两次均通过，验证了先前最容易复现的 stop/start 回归。
+部署后在目标板连续运行 10 次均通过，验证了先前最容易复现的 stop/start 回归。
 
 ## 面试可讲的要点
 

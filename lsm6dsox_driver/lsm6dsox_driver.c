@@ -281,13 +281,17 @@ static int lsm6dsox_config_int1_drdy(struct i2c_client *client)
 	int ret;
 
 	ret = lsm6dsox_write_int1_ctrl(client,
-					 LSM6DSOX_INT1_DRDY_XL |
-					 LSM6DSOX_INT1_DRDY_G,
+					 LSM6DSOX_INT1_DRDY_XL,
 					 "enable");
 	if (ret < 0)
 		return ret;
 
-	dev_info(&client->dev, "INT1 data-ready interrupt enabled\n");
+	/*
+	 * Accel and gyro use the same ODR.  One accel DRDY marks a coherent scan
+	 * of both data sets; routing both sources to an edge-triggered GPIO can
+	 * produce back-to-back edges and leave the shared line in the wrong state.
+	 */
+	dev_info(&client->dev, "INT1 accel data-ready interrupt enabled\n");
 	return 0;
 }
 
