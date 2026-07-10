@@ -24,6 +24,8 @@ robotics-facing data pipeline.
   buffered frames.
 - `docs/iio-buffer-service-incident.md`: systemd/IIO buffer fault analysis,
   lifecycle fix, and interview-oriented troubleshooting notes.
+- `docs/imu-calibration.md`: stationary gyro-bias capture, covariance
+  parameters, and frame configuration.
 
 ## Implemented features
 
