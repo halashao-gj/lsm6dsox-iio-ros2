@@ -22,6 +22,8 @@ robotics-facing data pipeline.
   boot-time auto-load validation.
 - `docs/ros2-buffer-validation.md`: ROS 2 validation using `/dev/iio:device1`
   buffered frames.
+- `docs/iio-buffer-service-incident.md`: systemd/IIO buffer fault analysis,
+  lifecycle fix, and interview-oriented troubleshooting notes.
 
 ## Implemented features
 
