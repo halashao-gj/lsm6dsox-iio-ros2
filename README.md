@@ -33,6 +33,8 @@ robotics-facing data pipeline.
 
 - Device tree match with `compatible = "study,lsm6dsox-minimal"`.
 - I2C probe with `WHO_AM_I=0x6c` verification.
+- Standard `regmap-i2c` register access with read, write, masked update, and
+  bulk-read paths.
 - Software reset, BDU enable, and 104 Hz accel/gyro configuration.
 - IIO accel and angular velocity channels for X/Y/Z axes.
 - `raw`, `scale`, and `sampling_frequency` IIO attributes.
@@ -40,6 +42,9 @@ robotics-facing data pipeline.
 - IIO trigger and triggered buffer support.
 - 24-byte buffered scan frame: accel XYZ, gyro XYZ, timestamp.
 - ROS 2 publisher with IIO device auto-detection and launch file support.
+- Parameterized frame ID, stationary gyro-bias correction, and covariance
+  loading from a per-board calibration YAML.
+- A manual-start systemd service and one-command IIO-to-ROS validation.
 
 ## Validated hardware
 
@@ -59,6 +64,27 @@ Observed validation results:
 - ROS 2 publisher directly consumed `/dev/iio:device1` buffered frames and
   published `/imu/data` at about `102.5 Hz`.
 - Madgwick filter and rosbag recording were validated on the board.
+- The post-regmap systemd/IIO/ROS validation passed after a clean board reboot.
+
+## v1.0.0 Release Scope
+
+The v1.0.0 release covers the complete hardware-to-ROS pipeline:
+
+```text
+Device Tree → I2C probe/regmap → INT1 IRQ → IIO triggered buffer
+           → /dev/iio:deviceX → ROS 2 Imu → systemd service
+```
+
+Before a deployment or release, run this final board-side acceptance check:
+
+```sh
+cd /home/cat/ros2_ws/src/lsm6dsox_ros
+./scripts/validate_lsm6dsox_pipeline.sh
+```
+
+The systemd unit is installed but deliberately remains disabled at boot. This
+keeps IMU collection an explicit operational choice; enable it only after the
+target deployment requires an always-on sensor stream.
 
 ## Build
 
@@ -117,6 +143,8 @@ sudo ./IIO-raw/iio_buffer_reader /dev/iio:device1 20
 ## Current limitations
 
 - The driver is still an out-of-tree learning driver.
-- Register access is direct SMBus access rather than `regmap`.
-- ROS 2 diagnostics, calibration, covariance parameters, and automatic module
-  service startup are planned follow-ups.
+- No hardware FIFO or FIFO watermark support.
+- No runtime PM, suspend/resume handling, or regcache synchronization policy.
+- Accelerometer six-face scale/bias and installation-axis calibration are not
+  implemented; stationary accel means are recorded but gravity is not removed.
+- The systemd service is not enabled at boot by default.
