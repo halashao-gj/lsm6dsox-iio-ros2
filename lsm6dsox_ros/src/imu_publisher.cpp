@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -29,6 +30,11 @@ public:
                        : requested_device_path;
     device_node_ = make_device_node_path(device_path_);
     frame_id_ = declare_parameter<std::string>("frame_id", "imu_link");
+    gyro_bias_ = read_vector_parameter("gyro_bias", {0.0, 0.0, 0.0});
+    angular_velocity_covariance_ = read_vector_parameter(
+        "angular_velocity_covariance_diagonal", {0.0, 0.0, 0.0});
+    linear_acceleration_covariance_ = read_vector_parameter(
+        "linear_acceleration_covariance_diagonal", {0.0, 0.0, 0.0});
 
     // Scale values change only when the sensor range changes, so read them once.
     accel_scale_ = read_iio_value("in_accel_scale");
@@ -61,6 +67,9 @@ public:
                 device_node_.c_str(), device_path_.c_str());
     RCLCPP_INFO(get_logger(), "accel_scale=%.9f gyro_scale=%.9f",
                 accel_scale_, gyro_scale_);
+    RCLCPP_INFO(get_logger(), "frame_id=%s gyro_bias=[%.9f, %.9f, %.9f]",
+                frame_id_.c_str(), gyro_bias_[0], gyro_bias_[1],
+                gyro_bias_[2]);
   }
 
   ~Lsm6dsoxImuPublisher() override {
@@ -166,6 +175,18 @@ private:
     return static_cast<int64_t>(value);
   }
 
+  std::array<double, 3> read_vector_parameter(
+      const std::string &name, const std::array<double, 3> &default_value) {
+    const auto values = declare_parameter<std::vector<double>>(
+        name, {default_value[0], default_value[1], default_value[2]});
+
+    if (values.size() != default_value.size()) {
+      throw std::runtime_error("parameter " + name + " must contain 3 values");
+    }
+
+    return {values[0], values[1], values[2]};
+  }
+
   double read_iio_value(const std::string &name) const {
     return read_number(device_path_ + "/" + name);
   }
@@ -261,9 +282,16 @@ private:
     msg.linear_acceleration.y = accel_y * accel_scale_;
     msg.linear_acceleration.z = accel_z * accel_scale_;
 
-    msg.angular_velocity.x = gyro_x * gyro_scale_;
-    msg.angular_velocity.y = gyro_y * gyro_scale_;
-    msg.angular_velocity.z = gyro_z * gyro_scale_;
+    msg.angular_velocity.x = gyro_x * gyro_scale_ - gyro_bias_[0];
+    msg.angular_velocity.y = gyro_y * gyro_scale_ - gyro_bias_[1];
+    msg.angular_velocity.z = gyro_z * gyro_scale_ - gyro_bias_[2];
+
+    msg.angular_velocity_covariance[0] = angular_velocity_covariance_[0];
+    msg.angular_velocity_covariance[4] = angular_velocity_covariance_[1];
+    msg.angular_velocity_covariance[8] = angular_velocity_covariance_[2];
+    msg.linear_acceleration_covariance[0] = linear_acceleration_covariance_[0];
+    msg.linear_acceleration_covariance[4] = linear_acceleration_covariance_[1];
+    msg.linear_acceleration_covariance[8] = linear_acceleration_covariance_[2];
 
     msg.orientation.w = 1.0;
     msg.orientation_covariance[0] = -1.0;
@@ -276,6 +304,9 @@ private:
   std::string frame_id_;
   double accel_scale_{0.0};
   double gyro_scale_{0.0};
+  std::array<double, 3> gyro_bias_{};
+  std::array<double, 3> angular_velocity_covariance_{};
+  std::array<double, 3> linear_acceleration_covariance_{};
   int device_fd_{-1};
   std::atomic<bool> running_{false};
   std::thread worker_thread_;
