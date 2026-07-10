@@ -8,6 +8,7 @@
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/trigger_consumer.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/atomic.h>
 #include <linux/interrupt.h>
@@ -50,6 +51,8 @@
 #define LSM6DSOX_GYRO_SCALE_UDPS	8750000
 #define LSM6DSOX_RESET_DELAY_MS		50
 #define LSM6DSOX_STARTUP_DELAY_MS	20
+#define LSM6DSOX_INT1_RETRIES		3
+#define LSM6DSOX_INT1_RETRY_DELAY_MS	20
 
 struct lsm6dsox_odr_entry {
 	int hz;
@@ -66,8 +69,12 @@ static const struct lsm6dsox_odr_entry lsm6dsox_odr_table[] = {
 struct lsm6dsox_data {
 	struct i2c_client *client;
 	struct iio_trigger *trig;
+	struct mutex lock;
 	int accel_odr;
 	int gyro_odr;
+	bool buffer_enabled;
+	atomic_t irq_count;
+	atomic_t sample_count;
 };
 struct lsm6dsox_scan {
 	s16 accel_x;
@@ -187,13 +194,11 @@ static const unsigned long lsm6dsox_scan_masks[] = {
 	0,             /* 结束标志 */
 };
 
-static atomic_t lsm6dsox_irq_count = ATOMIC_INIT(0);
-
 static irqreturn_t lsm6dsox_irq_thread(int irq, void *private)
 {
 	struct iio_dev *indio_dev = private;
 	struct lsm6dsox_data *data = iio_priv(indio_dev);
-	int count = atomic_inc_return(&lsm6dsox_irq_count);
+	int count = atomic_inc_return(&data->irq_count);
 
 	if (count <= 10 || count % 100 == 0)
 		dev_info(&data->client->dev, "data-ready irq count=%d\n", count);
@@ -234,6 +239,8 @@ static irqreturn_t lsm6dsox_trigger_handler(int irq, void *p)
 
 	iio_push_to_buffers_with_timestamp(indio_dev, &scan,
 					  pf->timestamp);
+	if (atomic_inc_return(&data->sample_count) == 1)
+		dev_info(&data->client->dev, "first IIO buffer frame queued\n");
 
 done:
 	iio_trigger_notify_done(indio_dev->trig);
@@ -248,17 +255,37 @@ static int lsm6dsox_validate_trigger(struct iio_dev *indio_dev,
 	return data->trig == trig ? 0 : -EINVAL;
 }
 
+static int lsm6dsox_write_int1_ctrl(struct i2c_client *client, u8 value,
+					    const char *operation)
+{
+	int attempt;
+	int ret = 0;
+
+	for (attempt = 0; attempt < LSM6DSOX_INT1_RETRIES; attempt++) {
+		ret = i2c_smbus_write_byte_data(client, LSM6DSOX_REG_INT1_CTRL,
+						       value);
+		if (ret >= 0)
+			return 0;
+
+		if (attempt + 1 < LSM6DSOX_INT1_RETRIES)
+			msleep(LSM6DSOX_INT1_RETRY_DELAY_MS);
+	}
+
+	dev_err(&client->dev, "failed to %s INT1_CTRL after %d attempts: %d\n",
+		operation, LSM6DSOX_INT1_RETRIES, ret);
+	return ret;
+}
+
 static int lsm6dsox_config_int1_drdy(struct i2c_client *client)
 {
 	int ret;
 
-	ret = i2c_smbus_write_byte_data(client, LSM6DSOX_REG_INT1_CTRL,
-					LSM6DSOX_INT1_DRDY_XL |
-					LSM6DSOX_INT1_DRDY_G);
-	if (ret < 0) {
-		dev_err(&client->dev, "failed to configure INT1_CTRL: %d\n", ret);
+	ret = lsm6dsox_write_int1_ctrl(client,
+					 LSM6DSOX_INT1_DRDY_XL |
+					 LSM6DSOX_INT1_DRDY_G,
+					 "enable");
+	if (ret < 0)
 		return ret;
-	}
 
 	dev_info(&client->dev, "INT1 data-ready interrupt enabled\n");
 	return 0;
@@ -268,11 +295,9 @@ static int lsm6dsox_disable_int1_drdy(struct i2c_client *client)
 {
 	int ret;
 
-	ret = i2c_smbus_write_byte_data(client, LSM6DSOX_REG_INT1_CTRL, 0);
-	if (ret < 0) {
-		dev_err(&client->dev, "failed to disable INT1_CTRL: %d\n", ret);
+	ret = lsm6dsox_write_int1_ctrl(client, 0, "disable");
+	if (ret < 0)
 		return ret;
-	}
 
 	dev_info(&client->dev, "INT1 data-ready interrupt disabled\n");
 	return 0;
@@ -280,18 +305,64 @@ static int lsm6dsox_disable_int1_drdy(struct i2c_client *client)
 
 static int lsm6dsox_set_trigger_state(struct iio_trigger *trig, bool state)
 {
-	struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
-	struct lsm6dsox_data *data = iio_priv(indio_dev);
-
-	if (state)
-		return lsm6dsox_config_int1_drdy(data->client);
-
-	return lsm6dsox_disable_int1_drdy(data->client);
+	/*
+	 * INT1 is owned by the buffer lifecycle below.  A trigger can be selected
+	 * before the buffer is enabled, so using this callback to toggle hardware
+	 * leaves the sensor state dependent on IIO trigger reference counting.
+	 */
+	return 0;
 }
 
 static const struct iio_trigger_ops lsm6dsox_trigger_ops = {
 	.set_trigger_state = lsm6dsox_set_trigger_state,
 	.validate_device = iio_trigger_validate_own_device,
+};
+
+static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
+{
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	int ret = 0;
+
+	mutex_lock(&data->lock);
+	if (!data->buffer_enabled) {
+		atomic_set(&data->irq_count, 0);
+		atomic_set(&data->sample_count, 0);
+		ret = lsm6dsox_config_int1_drdy(data->client);
+		if (!ret)
+			data->buffer_enabled = true;
+	}
+	mutex_unlock(&data->lock);
+
+	return ret;
+}
+
+static int lsm6dsox_buffer_predisable(struct iio_dev *indio_dev)
+{
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	int ret = 0;
+
+	mutex_lock(&data->lock);
+	if (data->buffer_enabled) {
+		ret = lsm6dsox_disable_int1_drdy(data->client);
+		/*
+		 * Teardown must not poison the next enable cycle.  The hardware state
+		 * is unknown after an I2C error, so force postenable() to reprogram it.
+		 */
+		data->buffer_enabled = false;
+	}
+	mutex_unlock(&data->lock);
+
+	if (ret < 0)
+		dev_warn(&data->client->dev,
+			 "continuing buffer teardown after INT1 disable failure: %d\n",
+			 ret);
+
+	return 0;
+}
+
+static const struct iio_buffer_setup_ops lsm6dsox_buffer_ops = {
+	.postenable = lsm6dsox_buffer_postenable,
+	.predisable = lsm6dsox_buffer_predisable,
 };
 
 static int lsm6dsox_soft_reset(struct i2c_client *client)
@@ -705,6 +776,7 @@ static int lsm6dsox_probe(struct i2c_client *client)
 
 	data = iio_priv(indio_dev);
 	data->client = client;
+	mutex_init(&data->lock);
 	data->accel_odr = LSM6DSOX_SAMP_FREQ_HZ;
 	data->gyro_odr = LSM6DSOX_SAMP_FREQ_HZ;
 
@@ -740,7 +812,7 @@ static int lsm6dsox_probe(struct i2c_client *client)
 					      indio_dev,
 					      iio_pollfunc_store_time,
 					      lsm6dsox_trigger_handler,
-					      NULL);
+					      &lsm6dsox_buffer_ops);
 	if (ret < 0) {
 		dev_err(&client->dev,
 			"failed to setup triggered buffer: %d\n", ret);
@@ -750,7 +822,8 @@ static int lsm6dsox_probe(struct i2c_client *client)
 	dev_info(&client->dev, "IIO triggered buffer setup complete\n");
 
 	if (client->irq > 0) {
-		atomic_set(&lsm6dsox_irq_count, 0);
+		atomic_set(&data->irq_count, 0);
+		atomic_set(&data->sample_count, 0);
 
 		ret = devm_request_threaded_irq(&client->dev,
 						client->irq,
@@ -783,6 +856,11 @@ static int lsm6dsox_probe(struct i2c_client *client)
 
 static void lsm6dsox_remove(struct i2c_client *client)
 {
+	struct iio_dev *indio_dev = i2c_get_clientdata(client);
+
+	/* Balance the reference taken when the driver's trigger became current. */
+	if (indio_dev && indio_dev->trig)
+		iio_trigger_put(indio_dev->trig);
 }
 
 static const struct of_device_id lsm6dsox_of_match[] = {
