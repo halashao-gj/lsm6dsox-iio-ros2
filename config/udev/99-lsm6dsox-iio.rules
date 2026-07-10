@@ -1,0 +1,2 @@
+# Grant members of the iio group access to the LSM6DSOX buffered IIO device.
+SUBSYSTEM=="iio", KERNEL=="iio:device*", ATTR{name}=="lsm6dsox", GROUP="iio", MODE="0660"

@@ -66,9 +66,11 @@ write_sysfs "$TRIGGER_NAME" "$iio_device/trigger/current_trigger"
 write_sysfs "$BUFFER_LENGTH" "$iio_device/buffer/length"
 write_sysfs 1 "$iio_device/buffer/enable"
 
-# This is intentionally temporary. Replace it with a udev rule for permanent
-# non-root access once the deployment user/group policy is decided.
-sudo chmod a+r "$device_node"
+if [[ ! -r "$device_node" ]]; then
+  echo "IIO character device '$device_node' is not readable by $(id -un)." >&2
+  echo "Install config/udev/99-lsm6dsox-iio.rules and add the user to the iio group." >&2
+  exit 1
+fi
 
 echo "IIO buffer enabled"
 echo "  device:  $iio_device"

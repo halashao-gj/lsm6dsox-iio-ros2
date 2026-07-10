@@ -15,6 +15,7 @@ robotics-facing data pipeline.
 - `IIO-raw/`: small userspace reader for `/dev/iio:deviceX` buffered frames.
 - `lsm6dsox_ros/`: ROS 2 Humble C++ publisher for `/imu/data`.
 - `scripts/`: IIO buffer enable/disable helpers for the board runtime.
+- `config/udev/`: persistent non-root IIO device access rule.
 - `docs/validation.md`: hardware and ROS 2 validation summary.
 - `docs/modprobe-deployment.md`: module installation, `modprobe`, and
   boot-time auto-load validation.
@@ -76,9 +77,10 @@ Install the device tree overlay as described in
 buffer before starting the ROS 2 node.
 
 Run these commands from the repository root on the board. The helper finds the
-`name=lsm6dsox` IIO device and its matching trigger automatically. It uses
-`sudo` to write sysfs settings and temporarily grants read permission to the
-IIO character device for the current ROS 2 launch.
+`name=lsm6dsox` IIO device and its matching trigger automatically. Install the
+udev rule in `docs/udev-deployment.md` once before first use; it makes IIO
+device access persistent for members of the `iio` group. The helper still uses
+`sudo` for privileged IIO sysfs settings.
 
 ```sh
 ./scripts/enable_lsm6dsox_buffer.sh
@@ -107,4 +109,4 @@ sudo ./IIO-raw/iio_buffer_reader /dev/iio:device1 20
 - The driver is still an out-of-tree learning driver.
 - Register access is direct SMBus access rather than `regmap`.
 - ROS 2 diagnostics, calibration, covariance parameters, and automatic module
-  loading are planned follow-ups.
+  service startup are planned follow-ups.
