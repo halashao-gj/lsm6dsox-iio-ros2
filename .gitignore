@@ -1,0 +1,34 @@
+# Kernel build outputs
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+.*.cmd
+
+# Device tree build outputs
+*.dtbo
+
+# Userspace build outputs
+IIO-raw/iio_buffer_reader
+
+# ROS 2 / colcon outputs
+build/
+install/
+log/
+
+# Local editor and tooling state
+.vscode/
+.clangd
+.cache/
+compile_commands.json
+
+# Earlier driver-study exercises kept locally outside this project release
+hello*
+can-test/
+lbc_dev/
+lbc_platform/
+/Makefile
+compile_flags.txt
