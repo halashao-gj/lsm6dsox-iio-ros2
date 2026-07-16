@@ -13,9 +13,8 @@ if ! [[ "$BUFFER_LENGTH" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-if ! [[ "$FIFO_WATERMARK" =~ ^[1-9][0-9]*$ ]] ||
-   (( FIFO_WATERMARK > 255 )); then
-  echo "FIFO_WATERMARK must be between 1 and 255, got: $FIFO_WATERMARK" >&2
+if ! [[ "$FIFO_WATERMARK" =~ ^[1-9][0-9]*$ ]]; then
+  echo "FIFO_WATERMARK must be a positive integer, got: $FIFO_WATERMARK" >&2
   exit 1
 fi
 
@@ -30,6 +29,12 @@ done
 
 if [[ -z "$iio_device" ]]; then
   echo "IIO device named '$DEVICE_NAME' was not found." >&2
+  exit 1
+fi
+
+fifo_watermark_max="$(<"$iio_device/buffer/hwfifo_watermark_max")"
+if (( FIFO_WATERMARK > fifo_watermark_max )); then
+  echo "FIFO_WATERMARK must be between 1 and $fifo_watermark_max, got: $FIFO_WATERMARK" >&2
   exit 1
 fi
 

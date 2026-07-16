@@ -23,12 +23,15 @@
 #define LSM6DSOX_REG_CTRL1_XL		0x10
 #define LSM6DSOX_REG_CTRL2_G		0x11
 #define LSM6DSOX_REG_CTRL3_C		0x12
+#define LSM6DSOX_REG_CTRL10_C		0x19
 #define LSM6DSOX_REG_INT1_CTRL		0x0d
 #define LSM6DSOX_REG_FIFO_CTRL1		0x07
 #define LSM6DSOX_REG_FIFO_CTRL2		0x08
 #define LSM6DSOX_REG_FIFO_CTRL3		0x09
 #define LSM6DSOX_REG_FIFO_CTRL4		0x0a
 #define LSM6DSOX_REG_FIFO_STATUS1	0x3a
+#define LSM6DSOX_REG_TIMESTAMP2		0x42
+#define LSM6DSOX_REG_INTERNAL_FREQ_FINE	0x63
 #define LSM6DSOX_REG_FIFO_DATA_OUT_TAG	0x78
 #define LSM6DSOX_REG_OUTX_L_G		0x22
 #define LSM6DSOX_REG_OUTX_L_A		0x28
@@ -51,6 +54,7 @@
 /* CTRL3_C control bits. */
 #define LSM6DSOX_SW_RESET		BIT(0)
 #define LSM6DSOX_BDU			BIT(6)
+#define LSM6DSOX_TIMESTAMP_EN		BIT(5)
 
 /* INT1_CTRL: route FIFO watermark to INT1. */
 #define LSM6DSOX_INT1_FIFO_TH		BIT(3)
@@ -59,6 +63,8 @@
 #define LSM6DSOX_FIFO_WTM_MASK		GENMASK(8, 0)
 #define LSM6DSOX_FIFO_BDR_XL_MASK	GENMASK(3, 0)
 #define LSM6DSOX_FIFO_BDR_G_MASK		GENMASK(7, 4)
+#define LSM6DSOX_FIFO_TIMESTAMP_DEC_MASK	GENMASK(7, 6)
+#define LSM6DSOX_FIFO_TIMESTAMP_DEC_1	FIELD_PREP(LSM6DSOX_FIFO_TIMESTAMP_DEC_MASK, 1)
 #define LSM6DSOX_FIFO_MODE_MASK		GENMASK(2, 0)
 #define LSM6DSOX_FIFO_MODE_BYPASS	0x0
 #define LSM6DSOX_FIFO_MODE_CONTINUOUS	0x6
@@ -69,11 +75,15 @@
 #define LSM6DSOX_FIFO_WATERMARK		BIT(15)
 #define LSM6DSOX_FIFO_GYRO_TAG		0x01
 #define LSM6DSOX_FIFO_ACCEL_TAG		0x02
+#define LSM6DSOX_FIFO_TIMESTAMP_TAG	0x04
 #define LSM6DSOX_FIFO_ENTRY_SIZE		7
+#define LSM6DSOX_FIFO_ENTRIES_PER_SCAN	3
 #define LSM6DSOX_FIFO_MAX_ENTRIES	512
-#define LSM6DSOX_FIFO_MAX_SCANS		255
+#define LSM6DSOX_FIFO_MAX_SCANS		170
 #define LSM6DSOX_FIFO_TARGET_READ_CHUNK	112
 #define LSM6DSOX_FIFO_DEFAULT_WATERMARK	4
+#define LSM6DSOX_TIMESTAMP_RESET_VALUE	0xaa
+#define LSM6DSOX_TIMESTAMP_NOMINAL_NS	25000
 
 #define LSM6DSOX_SAMP_FREQ_HZ		104
 #define LSM6DSOX_ACCEL_SCALE_UG		61000
@@ -108,15 +118,30 @@ struct lsm6dsox_data {
 	unsigned int fifo_hw_entries;
 	unsigned int fifo_read_chunk;
 	bool buffer_enabled;
+	bool fifo_faulted;
 	bool timestamp_valid;
+	bool hw_timestamp_valid;
+	u32 last_hw_timestamp;
+	u64 hw_timestamp_wraps;
+	s64 hw_timestamp_ref_ns;
+	s64 hw_timestamp_tick_ns;
 	s64 last_timestamp_ns;
 	u8 *fifo_raw;
+	u32 *fifo_hw_timestamps;
 	struct lsm6dsox_scan *fifo_scans;
 	atomic_t irq_count;
 	atomic_t sample_count;
 	atomic64_t fifo_overflow_count;
 	atomic64_t i2c_error_count;
 	atomic64_t fifo_tag_error_count;
+	atomic64_t fifo_dropped_scan_count;
+	atomic64_t fifo_unknown_loss_count;
+	atomic64_t fifo_discontinuity_count;
+	atomic64_t fifo_recovery_count;
+	atomic64_t fifo_recovery_failure_count;
+	atomic64_t timestamp_backward_count;
+	atomic64_t timestamp_gap_count;
+	atomic64_t timestamp_rollover_count;
 };
 struct lsm6dsox_scan {
 	s16 accel_x;
@@ -257,8 +282,8 @@ static const unsigned long lsm6dsox_scan_masks[] = {
 	0,             /* 结束标志 */
 };
 
-static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev, s64 anchor_ns,
-			       unsigned int max_scans, bool watermark_event);
+static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev,
+			       unsigned int max_scans);
 
 static irqreturn_t lsm6dsox_irq_handler(int irq, void *private)
 {
@@ -279,8 +304,7 @@ static irqreturn_t lsm6dsox_trigger_handler(int irq, void *p)
 	int ret;
 
 	mutex_lock(&data->lock);
-	ret = lsm6dsox_fifo_drain(indio_dev, pf->timestamp,
-				  LSM6DSOX_FIFO_MAX_SCANS, true);
+	ret = lsm6dsox_fifo_drain(indio_dev, LSM6DSOX_FIFO_MAX_SCANS);
 	mutex_unlock(&data->lock);
 	if (ret < 0)
 		dev_err_ratelimited(&data->client->dev,
@@ -350,9 +374,19 @@ static int lsm6dsox_fifo_set_batching(struct lsm6dsox_data *data, bool enable)
 				  value);
 }
 
+static int lsm6dsox_fifo_set_timestamp_batching(struct lsm6dsox_data *data,
+						 bool enable)
+{
+	return regmap_update_bits(data->regmap, LSM6DSOX_REG_FIFO_CTRL4,
+				  LSM6DSOX_FIFO_TIMESTAMP_DEC_MASK,
+				  enable ? LSM6DSOX_FIFO_TIMESTAMP_DEC_1 : 0);
+}
+
 static int lsm6dsox_fifo_program_watermark(struct lsm6dsox_data *data)
 {
-	unsigned int entries = clamp_val(data->fifo_watermark * 2, 2,
+	unsigned int entries = clamp_val(data->fifo_watermark *
+					 LSM6DSOX_FIFO_ENTRIES_PER_SCAN,
+					 LSM6DSOX_FIFO_ENTRIES_PER_SCAN,
 					 LSM6DSOX_FIFO_WTM_MASK);
 	int ret;
 
@@ -369,16 +403,85 @@ static int lsm6dsox_fifo_program_watermark(struct lsm6dsox_data *data)
 	return ret;
 }
 
-static int lsm6dsox_fifo_recover(struct lsm6dsox_data *data)
+static int lsm6dsox_reset_hw_timestamp(struct iio_dev *indio_dev)
 {
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
 	int ret;
 
-	data->timestamp_valid = false;
-	ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+	ret = regmap_write(data->regmap, LSM6DSOX_REG_TIMESTAMP2,
+			   LSM6DSOX_TIMESTAMP_RESET_VALUE);
 	if (ret < 0)
 		return ret;
 
-	return lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_CONTINUOUS);
+	data->hw_timestamp_ref_ns = iio_get_time_ns(indio_dev);
+	data->hw_timestamp_valid = false;
+	data->hw_timestamp_wraps = 0;
+	return 0;
+}
+
+static int lsm6dsox_fifo_recover(struct iio_dev *indio_dev)
+{
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	bool restore_irq = data->buffer_enabled;
+	int ret;
+
+	atomic64_inc(&data->fifo_discontinuity_count);
+	atomic64_inc(&data->fifo_recovery_count);
+	data->timestamp_valid = false;
+	data->hw_timestamp_valid = false;
+	data->fifo_faulted = true;
+
+	ret = lsm6dsox_write_int1_ctrl(data, 0, "mask for recovery");
+	if (ret < 0)
+		goto fail;
+
+	ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+	if (ret < 0)
+		goto fail;
+
+	ret = lsm6dsox_fifo_set_batching(data, false);
+	if (ret < 0)
+		goto fail;
+
+	ret = lsm6dsox_fifo_set_timestamp_batching(data, false);
+	if (ret < 0)
+		goto fail;
+
+	ret = lsm6dsox_fifo_program_watermark(data);
+	if (ret < 0)
+		goto fail;
+
+	ret = lsm6dsox_fifo_set_batching(data, true);
+	if (ret < 0)
+		goto fail;
+
+	ret = lsm6dsox_fifo_set_timestamp_batching(data, true);
+	if (ret < 0)
+		goto fail;
+
+	ret = lsm6dsox_reset_hw_timestamp(indio_dev);
+	if (ret < 0)
+		goto fail;
+
+	ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_CONTINUOUS);
+	if (ret < 0)
+		goto fail;
+
+	if (restore_irq) {
+		ret = lsm6dsox_write_int1_ctrl(data, LSM6DSOX_INT1_FIFO_TH,
+					       "restore after recovery");
+		if (ret < 0)
+			goto fail;
+	}
+
+	data->fifo_faulted = false;
+	return 0;
+
+fail:
+	atomic64_inc(&data->fifo_recovery_failure_count);
+	lsm6dsox_write_int1_ctrl(data, 0, "leave masked after recovery failure");
+	lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+	return ret;
 }
 
 static int lsm6dsox_fifo_read_status(struct lsm6dsox_data *data, u16 *status)
@@ -405,16 +508,44 @@ static void lsm6dsox_fifo_decode_xyz(const u8 *raw, s16 *x, s16 *y,
 	*z = (s16)(((u16)raw[5] << 8) | raw[4]);
 }
 
+static u32 lsm6dsox_fifo_decode_timestamp(const u8 *raw)
+{
+	return raw[0] | ((u32)raw[1] << 8) | ((u32)raw[2] << 16) |
+	       ((u32)raw[3] << 24);
+}
+
+static int lsm6dsox_hw_timestamp_to_ns(struct lsm6dsox_data *data,
+					      u32 raw, s64 *timestamp)
+{
+	u64 extended;
+
+	if (data->hw_timestamp_valid && raw < data->last_hw_timestamp) {
+		if (data->last_hw_timestamp - raw > BIT(31)) {
+			data->hw_timestamp_wraps++;
+			atomic64_inc(&data->timestamp_rollover_count);
+		} else {
+			atomic64_inc(&data->timestamp_backward_count);
+			return -ERANGE;
+		}
+	}
+
+	data->last_hw_timestamp = raw;
+	data->hw_timestamp_valid = true;
+	extended = (data->hw_timestamp_wraps << 32) | raw;
+	*timestamp = data->hw_timestamp_ref_ns +
+		     extended * data->hw_timestamp_tick_ns;
+	return 0;
+}
+
 static int lsm6dsox_fifo_read_entries(struct iio_dev *indio_dev,
-				      unsigned int entries, s64 anchor_ns,
-				      bool watermark_event)
+				      unsigned int entries)
 {
 	struct lsm6dsox_data *data = iio_priv(indio_dev);
 	struct lsm6dsox_scan pending = { };
-	bool have_accel = false, have_gyro = false;
+	bool have_accel = false, have_gyro = false, malformed = false;
 	unsigned int bytes = entries * LSM6DSOX_FIFO_ENTRY_SIZE;
-	unsigned int offset = 0, scan_count = 0, i;
-	s64 period_ns, first_ts;
+	unsigned int offset = 0, scan_count = 0, timestamp_count = 0, i;
+	s64 period_ns;
 	int ret;
 
 	while (offset < bytes) {
@@ -426,7 +557,7 @@ static int lsm6dsox_fifo_read_entries(struct iio_dev *indio_dev,
 				       data->fifo_raw + offset, chunk);
 		if (ret < 0) {
 			atomic64_inc(&data->i2c_error_count);
-			lsm6dsox_fifo_recover(data);
+			lsm6dsox_fifo_recover(indio_dev);
 			return ret;
 		}
 		offset += chunk;
@@ -439,52 +570,92 @@ static int lsm6dsox_fifo_read_entries(struct iio_dev *indio_dev,
 
 		switch (tag) {
 		case LSM6DSOX_FIFO_GYRO_TAG:
-			if (have_gyro)
+			if (have_gyro) {
 				atomic64_inc(&data->fifo_tag_error_count);
+				malformed = true;
+			}
 			lsm6dsox_fifo_decode_xyz(entry + 1, &pending.gyro_x,
 						 &pending.gyro_y, &pending.gyro_z);
 			have_gyro = true;
 			break;
 		case LSM6DSOX_FIFO_ACCEL_TAG:
-			if (have_accel)
+			if (have_accel) {
 				atomic64_inc(&data->fifo_tag_error_count);
+				malformed = true;
+			}
 			lsm6dsox_fifo_decode_xyz(entry + 1, &pending.accel_x,
 						 &pending.accel_y, &pending.accel_z);
 			have_accel = true;
 			break;
+		case LSM6DSOX_FIFO_TIMESTAMP_TAG:
+			if (timestamp_count >= LSM6DSOX_FIFO_MAX_SCANS) {
+				malformed = true;
+				break;
+			}
+			data->fifo_hw_timestamps[timestamp_count++] =
+				lsm6dsox_fifo_decode_timestamp(entry + 1);
+			break;
 		default:
 			atomic64_inc(&data->fifo_tag_error_count);
+			malformed = true;
 			dev_warn_ratelimited(&data->client->dev,
 					     "unexpected FIFO tag 0x%02x\n", tag);
 			continue;
 		}
 
 		if (have_accel && have_gyro) {
-			data->fifo_scans[scan_count++] = pending;
+			if (scan_count < LSM6DSOX_FIFO_MAX_SCANS)
+				data->fifo_scans[scan_count++] = pending;
+			else
+				malformed = true;
 			memset(&pending, 0, sizeof(pending));
 			have_accel = false;
 			have_gyro = false;
 		}
 	}
-	if (have_accel || have_gyro)
+	if (have_accel || have_gyro) {
 		atomic64_inc(&data->fifo_tag_error_count);
+		malformed = true;
+	}
 
-	if (!scan_count)
-		return 0;
+	if (malformed || !scan_count || scan_count != timestamp_count) {
+		atomic64_add(scan_count ? scan_count : 1,
+			     &data->fifo_dropped_scan_count);
+		dev_warn_ratelimited(&data->client->dev,
+			"discarding malformed FIFO batch: scans=%u timestamps=%u\n",
+			scan_count, timestamp_count);
+		lsm6dsox_fifo_recover(indio_dev);
+		return -EBADMSG;
+	}
 
 	period_ns = div_s64(NSEC_PER_SEC, data->accel_odr);
-	if (watermark_event)
-		first_ts = anchor_ns -
-			   (min_t(unsigned int, data->fifo_watermark, scan_count) - 1) *
-			   period_ns;
-	else
-		first_ts = anchor_ns - (scan_count - 1) * period_ns;
+	for (i = 0; i < scan_count; i++) {
+		s64 timestamp;
+		s64 previous = i ? data->fifo_scans[i - 1].timestamp :
+				     data->last_timestamp_ns;
 
-	if (data->timestamp_valid)
-		first_ts = max(first_ts, data->last_timestamp_ns + period_ns);
+		ret = lsm6dsox_hw_timestamp_to_ns(data,
+						 data->fifo_hw_timestamps[i],
+						 &timestamp);
+		if (ret < 0 || ((i || data->timestamp_valid) &&
+				 timestamp <= previous)) {
+			if (!ret)
+				atomic64_inc(&data->timestamp_backward_count);
+			atomic64_add(scan_count, &data->fifo_dropped_scan_count);
+			lsm6dsox_fifo_recover(indio_dev);
+			return -ERANGE;
+		}
+
+		if ((i || data->timestamp_valid) &&
+		    timestamp - previous > period_ns * 2) {
+			atomic64_inc(&data->timestamp_gap_count);
+			atomic64_inc(&data->fifo_discontinuity_count);
+		}
+		data->fifo_scans[i].timestamp = timestamp;
+	}
 
 	for (i = 0; i < scan_count; i++) {
-		s64 timestamp = first_ts + i * period_ns;
+		s64 timestamp = data->fifo_scans[i].timestamp;
 
 		iio_push_to_buffers_with_timestamp(indio_dev,
 						   &data->fifo_scans[i], timestamp);
@@ -496,8 +667,8 @@ static int lsm6dsox_fifo_read_entries(struct iio_dev *indio_dev,
 	return scan_count;
 }
 
-static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev, s64 anchor_ns,
-			       unsigned int max_scans, bool watermark_event)
+static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev,
+			       unsigned int max_scans)
 {
 	struct lsm6dsox_data *data = iio_priv(indio_dev);
 	unsigned int total = 0;
@@ -511,27 +682,31 @@ static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev, s64 anchor_ns,
 
 		ret = lsm6dsox_fifo_read_status(data, &status);
 		if (ret < 0) {
-			lsm6dsox_fifo_recover(data);
+			lsm6dsox_fifo_recover(indio_dev);
 			return ret;
 		}
 
 		if (status & LSM6DSOX_FIFO_OVERRUN) {
 			atomic64_inc(&data->fifo_overflow_count);
+			atomic64_inc(&data->fifo_unknown_loss_count);
 			dev_warn_ratelimited(&data->client->dev,
 					     "FIFO overrun, resetting stream\n");
-			ret = lsm6dsox_fifo_recover(data);
+			ret = lsm6dsox_fifo_recover(indio_dev);
 			return ret < 0 ? ret : -EOVERFLOW;
 		}
 
 		entries = status & LSM6DSOX_FIFO_DIFF_MASK;
-		if ((status & LSM6DSOX_FIFO_EMPTY) || entries < 2)
+		if ((status & LSM6DSOX_FIFO_EMPTY) ||
+		    entries < LSM6DSOX_FIFO_ENTRIES_PER_SCAN)
 			break;
 
 		if (!first_pass && entries < data->fifo_hw_entries)
 			break;
 
-		scans = min_t(unsigned int, entries / 2, max_scans - total);
-		entries = scans * 2;
+		scans = min_t(unsigned int,
+				  entries / LSM6DSOX_FIFO_ENTRIES_PER_SCAN,
+				  max_scans - total);
+		entries = scans * LSM6DSOX_FIFO_ENTRIES_PER_SCAN;
 		/*
 		 * A normal watermark batch is fully consumed by this read and will
 		 * deassert INT1. Re-read status only after a delayed handler sees at
@@ -539,8 +714,7 @@ static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev, s64 anchor_ns,
 		 * could otherwise leave the FIFO above its threshold.
 		 */
 		recheck = scans >= data->fifo_watermark * 2;
-		ret = lsm6dsox_fifo_read_entries(indio_dev, entries, anchor_ns,
-						  watermark_event && first_pass);
+		ret = lsm6dsox_fifo_read_entries(indio_dev, entries);
 		if (ret < 0)
 			return ret;
 
@@ -618,7 +792,17 @@ static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 		atomic64_set(&data->fifo_overflow_count, 0);
 		atomic64_set(&data->i2c_error_count, 0);
 		atomic64_set(&data->fifo_tag_error_count, 0);
+		atomic64_set(&data->fifo_dropped_scan_count, 0);
+		atomic64_set(&data->fifo_unknown_loss_count, 0);
+		atomic64_set(&data->fifo_discontinuity_count, 0);
+		atomic64_set(&data->fifo_recovery_count, 0);
+		atomic64_set(&data->fifo_recovery_failure_count, 0);
+		atomic64_set(&data->timestamp_backward_count, 0);
+		atomic64_set(&data->timestamp_gap_count, 0);
+		atomic64_set(&data->timestamp_rollover_count, 0);
 		data->timestamp_valid = false;
+		data->hw_timestamp_valid = false;
+		data->fifo_faulted = false;
 
 		ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
 		if (ret < 0)
@@ -628,14 +812,22 @@ static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 		if (ret < 0)
 			goto out;
 
-		ret = lsm6dsox_fifo_program_watermark(data);
+		ret = lsm6dsox_fifo_set_timestamp_batching(data, true);
 		if (ret < 0)
 			goto err_disable_batching;
+
+		ret = lsm6dsox_fifo_program_watermark(data);
+		if (ret < 0)
+			goto err_disable_timestamp;
+
+		ret = lsm6dsox_reset_hw_timestamp(indio_dev);
+		if (ret < 0)
+			goto err_disable_timestamp;
 
 		ret = lsm6dsox_fifo_set_mode(data,
 					     LSM6DSOX_FIFO_MODE_CONTINUOUS);
 		if (ret < 0)
-			goto err_disable_batching;
+			goto err_disable_timestamp;
 
 		ret = lsm6dsox_config_int1_fifo(data);
 		if (ret < 0)
@@ -650,6 +842,8 @@ static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 
 err_bypass:
 	lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+err_disable_timestamp:
+	lsm6dsox_fifo_set_timestamp_batching(data, false);
 err_disable_batching:
 	lsm6dsox_fifo_set_batching(data, false);
 	}
@@ -672,12 +866,17 @@ static int lsm6dsox_buffer_predisable(struct iio_dev *indio_dev)
 			ret = -EIO;
 		if (lsm6dsox_fifo_set_batching(data, false) < 0 && !ret)
 			ret = -EIO;
+		if (lsm6dsox_fifo_set_timestamp_batching(data, false) < 0 &&
+		    !ret)
+			ret = -EIO;
 		/*
 		 * Teardown must not poison the next enable cycle.  The hardware state
 		 * is unknown after an I2C error, so force postenable() to reprogram it.
 		 */
 		data->buffer_enabled = false;
+		data->fifo_faulted = false;
 		data->timestamp_valid = false;
+		data->hw_timestamp_valid = false;
 		dev_info(&data->client->dev,
 			 "FIFO disabled: irqs=%d samples=%d overflows=%lld i2c_errors=%lld tag_errors=%lld\n",
 			 atomic_read(&data->irq_count),
@@ -685,6 +884,16 @@ static int lsm6dsox_buffer_predisable(struct iio_dev *indio_dev)
 			 atomic64_read(&data->fifo_overflow_count),
 			 atomic64_read(&data->i2c_error_count),
 			 atomic64_read(&data->fifo_tag_error_count));
+		dev_info(&data->client->dev,
+			 "FIFO diagnostics: dropped=%lld unknown_losses=%lld discontinuities=%lld recoveries=%lld recovery_failures=%lld ts_backwards=%lld ts_gaps=%lld ts_rollovers=%lld\n",
+			 atomic64_read(&data->fifo_dropped_scan_count),
+			 atomic64_read(&data->fifo_unknown_loss_count),
+			 atomic64_read(&data->fifo_discontinuity_count),
+			 atomic64_read(&data->fifo_recovery_count),
+			 atomic64_read(&data->fifo_recovery_failure_count),
+			 atomic64_read(&data->timestamp_backward_count),
+			 atomic64_read(&data->timestamp_gap_count),
+			 atomic64_read(&data->timestamp_rollover_count));
 	}
 	mutex_unlock(&data->lock);
 
@@ -764,6 +973,30 @@ static int lsm6dsox_enable_bdu(struct lsm6dsox_data *data)
 	}
 
 	dev_info(&data->client->dev, "BDU enabled, CTRL3_C=0x%02x\n", value);
+	return 0;
+}
+
+static int lsm6dsox_init_hw_timestamp(struct lsm6dsox_data *data)
+{
+	unsigned int fine;
+	int ret;
+
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL10_C,
+				 LSM6DSOX_TIMESTAMP_EN, LSM6DSOX_TIMESTAMP_EN);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_INTERNAL_FREQ_FINE,
+			  &fine);
+	if (ret < 0)
+		return ret;
+
+	/* AN5192: 25 us nominal tick, corrected by signed FREQ_FINE trim. */
+	data->hw_timestamp_tick_ns = LSM6DSOX_TIMESTAMP_NOMINAL_NS -
+				       ((s8)fine * 37500) / 1000;
+	dev_info(&data->client->dev,
+		 "hardware timestamp enabled: fine=%d tick=%lld ns\n",
+		 (s8)fine, data->hw_timestamp_tick_ns);
 	return 0;
 }
 
@@ -1093,6 +1326,30 @@ static ssize_t hwfifo_tag_error_count_show(struct device *dev,
 			  atomic64_read(&data->fifo_tag_error_count));
 }
 
+#define LSM6DSOX_COUNTER_ATTR_SHOW(_name, _member) \
+static ssize_t _name##_show(struct device *dev, \
+			    struct device_attribute *attr, char *buf) \
+{ \
+	struct lsm6dsox_data *data = iio_priv(dev_to_iio_dev(dev)); \
+\
+	return sysfs_emit(buf, "%lld\n", atomic64_read(&data->_member)); \
+}
+
+LSM6DSOX_COUNTER_ATTR_SHOW(hwfifo_dropped_scan_count,
+			   fifo_dropped_scan_count)
+LSM6DSOX_COUNTER_ATTR_SHOW(hwfifo_unknown_loss_count,
+			   fifo_unknown_loss_count)
+LSM6DSOX_COUNTER_ATTR_SHOW(hwfifo_discontinuity_count,
+			   fifo_discontinuity_count)
+LSM6DSOX_COUNTER_ATTR_SHOW(hwfifo_recovery_count, fifo_recovery_count)
+LSM6DSOX_COUNTER_ATTR_SHOW(hwfifo_recovery_failure_count,
+			   fifo_recovery_failure_count)
+LSM6DSOX_COUNTER_ATTR_SHOW(hwfifo_timestamp_backward_count,
+			   timestamp_backward_count)
+LSM6DSOX_COUNTER_ATTR_SHOW(hwfifo_timestamp_gap_count, timestamp_gap_count)
+LSM6DSOX_COUNTER_ATTR_SHOW(hwfifo_timestamp_rollover_count,
+			   timestamp_rollover_count)
+
 static ssize_t hwfifo_read_chunk_bytes_show(struct device *dev,
 					    struct device_attribute *attr,
 					    char *buf)
@@ -1102,13 +1359,40 @@ static ssize_t hwfifo_read_chunk_bytes_show(struct device *dev,
 	return sysfs_emit(buf, "%u\n", data->fifo_read_chunk);
 }
 
+static ssize_t hwfifo_timestamp_tick_ns_show(struct device *dev,
+					     struct device_attribute *attr,
+					     char *buf)
+{
+	struct lsm6dsox_data *data = iio_priv(dev_to_iio_dev(dev));
+
+	return sysfs_emit(buf, "%lld\n", data->hw_timestamp_tick_ns);
+}
+
+static ssize_t hwfifo_faulted_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct lsm6dsox_data *data = iio_priv(dev_to_iio_dev(dev));
+
+	return sysfs_emit(buf, "%u\n", data->fifo_faulted);
+}
+
 static IIO_DEVICE_ATTR_RO(hwfifo_watermark, 0);
 static IIO_DEVICE_ATTR_RO(hwfifo_watermark_min, 0);
 static IIO_DEVICE_ATTR_RO(hwfifo_watermark_max, 0);
 static IIO_DEVICE_ATTR_RO(hwfifo_overflow_count, 0);
 static IIO_DEVICE_ATTR_RO(hwfifo_i2c_error_count, 0);
 static IIO_DEVICE_ATTR_RO(hwfifo_tag_error_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_dropped_scan_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_unknown_loss_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_discontinuity_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_recovery_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_recovery_failure_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_timestamp_backward_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_timestamp_gap_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_timestamp_rollover_count, 0);
 static IIO_DEVICE_ATTR_RO(hwfifo_read_chunk_bytes, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_timestamp_tick_ns, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_faulted, 0);
 
 static const struct attribute *lsm6dsox_fifo_attributes[] = {
 	&iio_dev_attr_hwfifo_watermark.dev_attr.attr,
@@ -1117,7 +1401,17 @@ static const struct attribute *lsm6dsox_fifo_attributes[] = {
 	&iio_dev_attr_hwfifo_overflow_count.dev_attr.attr,
 	&iio_dev_attr_hwfifo_i2c_error_count.dev_attr.attr,
 	&iio_dev_attr_hwfifo_tag_error_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_dropped_scan_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_unknown_loss_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_discontinuity_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_recovery_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_recovery_failure_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_timestamp_backward_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_timestamp_gap_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_timestamp_rollover_count.dev_attr.attr,
 	&iio_dev_attr_hwfifo_read_chunk_bytes.dev_attr.attr,
+	&iio_dev_attr_hwfifo_timestamp_tick_ns.dev_attr.attr,
+	&iio_dev_attr_hwfifo_faulted.dev_attr.attr,
 	NULL,
 };
 
@@ -1192,6 +1486,13 @@ static int lsm6dsox_probe(struct i2c_client *client)
 	if (!data->fifo_scans)
 		return -ENOMEM;
 
+	data->fifo_hw_timestamps = devm_kcalloc(&client->dev,
+						LSM6DSOX_FIFO_MAX_SCANS,
+						sizeof(*data->fifo_hw_timestamps),
+						GFP_KERNEL);
+	if (!data->fifo_hw_timestamps)
+		return -ENOMEM;
+
 	ret = regmap_read(data->regmap, LSM6DSOX_REG_WHO_AM_I, &whoami);
 	if (ret < 0) {
 		dev_err(&client->dev, "failed to read WHO_AM_I: %d\n", ret);
@@ -1214,6 +1515,13 @@ static int lsm6dsox_probe(struct i2c_client *client)
 	ret = lsm6dsox_enable_bdu(data);
 	if (ret < 0)
 		return ret;
+
+	ret = lsm6dsox_init_hw_timestamp(data);
+	if (ret < 0) {
+		dev_err(&client->dev,
+			"failed to initialize hardware timestamp: %d\n", ret);
+		return ret;
+	}
 
 	ret = lsm6dsox_config_accel(data);
 	if (ret < 0)

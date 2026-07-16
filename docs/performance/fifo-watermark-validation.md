@@ -1,20 +1,20 @@
 # LSM6DSOX FIFO Watermark Validation
 
-## Test environment
+## FIFO v1 test environment
 
 - Board: LubanCat-3, RK3576, aarch64
 - Kernel: `6.1.99-rk3576`
 - Sensor: LSM6DSOX on I2C adapter 7, address `0x6a`
 - Interrupt: GPIO0_21, Linux IRQ 107, rising edge
 - Accelerometer and gyroscope ODR: 104 Hz
-- IIO scan: accel XYZ, gyro XYZ, software timestamp (24 bytes)
+- IIO scan: accel XYZ, gyro XYZ, software timestamp (24 bytes, historical v1)
 - Capture duration: 5 seconds per case
 
 The two cases used the same ODR, scan layout, reader and system. Only the
 IIO `buffer/watermark` value changed. I2C messages were counted by summing the
 `nr_msgs` field of the `i2c:i2c_result` tracepoint filtered to adapter 7.
 
-## Results
+## FIFO v1 results
 
 | Hardware watermark | Captured scans | IRQ count | IRQ/s | I2C messages | I2C messages/s |
 |---:|---:|---:|---:|---:|---:|
@@ -29,7 +29,7 @@ The reduction is not exactly `104 / 8 = 13 IRQ/s` because the FIFO handler can
 drain more than one watermark when scheduling or I2C latency allows additional
 samples to arrive before the FIFO status is read.
 
-## Correctness checks
+## FIFO v1 correctness checks
 
 - The final deployed module delivered an 80-frame userspace capture at
   watermark 8 with 10 IRQs and 88 queued scans (the handler drains the complete
@@ -44,7 +44,7 @@ samples to arrive before the FIFO status is read.
 - Clearing `current_trigger`, unloading and reloading the module completed
   successfully after removing the old driver's duplicate trigger release.
 
-## Implementation notes
+## FIFO v1 implementation notes
 
 - INT1 now carries FIFO-watermark events instead of per-sample accel DRDY.
 - The hardware FIFO stores tagged accel and gyro entries. The driver pairs one
@@ -59,14 +59,6 @@ samples to arrive before the FIFO status is read.
 - A FIFO I2C read failure discards the incomplete batch, increments the error
   counter, resets the FIFO and never pushes partially initialized scans.
 
-## Remaining work
-
-- Measure IRQ-thread CPU usage, scheduling latency and power at watermarks
-  1, 2, 4, 8 and 16.
-- Add fault-injection coverage for I2C failure and forced FIFO overrun.
-- Use the LSM6DSOX hardware timestamp tag to improve long-duration clock drift
-  and batch-boundary timestamp accuracy.
-
 ## FIFO v2 changes
 
 The follow-up FIFO revision changes the default watermark from 8 to 4, reducing
@@ -78,7 +70,7 @@ remains available for lower-latency control workloads.
   tagged entries. A normal four-scan batch therefore fits in one data read.
 - The threaded handler uses the IIO poll function's timestamp instead of a
   shared IRQ timestamp field, removing a possible overwrite race.
-- FIFO draining is bounded by the 255-scan budget instead of an arbitrary
+- FIFO draining was bounded by a scan budget instead of an arbitrary
   four-pass limit. Normal batches do not issue a redundant second status read;
   delayed handlers recheck only when at least two complete batches accumulated.
 - The optional eager `hwfifo_flush_to_buffer` callback is intentionally omitted.
@@ -123,3 +115,65 @@ userspace read caused 88 complete scans to be queued with 22 IRQs and a 4.873 ms
 mean interval. Both runs reported zero FIFO overflow, I2C error and tag error;
 the board was then restored to coherent 104 Hz accel/gyro ODR with its buffer
 disabled.
+
+## FIFO v3 hardware timestamps and recovery
+
+FIFO v3 enables the LSM6DSOX hardware timestamp engine and batches one
+timestamp tag with each coherent accel/gyro scan. Each combined scan therefore
+occupies three 7-byte FIFO entries. The maximum user watermark is 170 scans so
+that the programmed threshold remains within the 512-entry hardware FIFO and
+the 9-bit watermark field.
+
+At probe, `INTERNAL_FREQ_FINE=-11` calibrated the nominal 25 us hardware tick
+to 25,412 ns. The driver resets the hardware counter when enabling or recovering
+the FIFO, records the matching IIO clock reference, extends 32-bit rollover and
+converts each tag to nanoseconds. It discards a complete batch if its timestamp
+count does not match the paired accel/gyro count or a non-rollover tick moves
+backward.
+
+| ODR | Frames | Mean delta | Minimum | Maximum | Timestamp/tag errors |
+|---:|---:|---:|---:|---:|---:|
+| 26 Hz | 40 | 39.033 ms | 39.033 ms | 39.033 ms | 0 |
+| 52 Hz | 40 | 19.516 ms | 19.516 ms | 19.516 ms | 0 |
+| 104 Hz | 40 | 9.758 ms | 9.758 ms | 9.758 ms | 0 |
+| 208 Hz | 40 | 4.879 ms | 4.879 ms | 4.879 ms | 0 |
+
+The current 104 Hz, watermark-4 five-second run captured 512 userspace scans
+with 130 IRQs, 260 FIFO-thread I2C calls and 520 I2C messages. A normal IRQ
+still performs one status read and one 84-byte data read; adding the third
+timestamp entry did not increase the I2C call count. All overflow, I2C, tag and
+discontinuity counters remained zero.
+
+### Forced-overflow validation
+
+At 208 Hz, INT1 routing was deliberately masked for two seconds. FIFO status
+reached `0xea00`, including the overrun flag. After restoring INT1, the driver:
+
+1. detected the overrun and did not push the damaged FIFO contents;
+2. masked INT1 and switched FIFO to bypass;
+3. disabled sensor and timestamp batching;
+4. reprogrammed watermark, batching and the hardware timestamp reference;
+5. restored continuous mode and INT1, then delivered 20 new frames.
+
+The resulting counters were `overflow=1`, `unknown_loss=1`,
+`discontinuity=1`, `recovery=1` and `recovery_failure=0`. The exact number of
+overwritten scans is intentionally reported as unknown rather than replaced by
+interpolated samples.
+
+The ROS 2 publisher now publishes `lsm6dsox/FIFO` on `/diagnostics`. A clean run
+reported OK with all counters zero. The injected overflow produced WARN with
+the recovery and unknown-loss counters; a failed recovery would produce ERROR
+and report that INT1 remains masked.
+
+Twenty repeated hardware-timestamp FIFO enable/disable cycles completed with
+the buffer disabled. A watermark of 171 was rejected against the dynamic
+maximum of 170, and the board was restored to coherent 104 Hz accel/gyro ODR.
+
+## Remaining work
+
+- Measure IRQ-thread CPU usage, scheduling latency and power at watermarks
+  1, 2, 4, 8 and 16.
+- Add adapter-level I2C fault injection and verify the recovery-failure ERROR
+  diagnostic.
+- Run continuously for at least 30 hours to exercise a real 32-bit hardware
+  timestamp rollover.

@@ -8,10 +8,11 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(Threads REQUIRED)
 
 add_executable(imu_publisher src/imu_publisher.cpp)
-ament_target_dependencies(imu_publisher rclcpp sensor_msgs)
+ament_target_dependencies(imu_publisher rclcpp sensor_msgs diagnostic_msgs)
 target_link_libraries(imu_publisher Threads::Threads)
 
 install(TARGETS

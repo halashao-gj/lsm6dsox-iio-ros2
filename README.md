@@ -41,14 +41,18 @@ robotics-facing data pipeline.
   configuration through IIO sysfs.
 - IIO accel and angular velocity channels for X/Y/Z axes.
 - `raw`, `scale`, and `sampling_frequency` IIO attributes.
-- FIFO-watermark INT1 interrupt with tagged accel/gyro batch reads.
+- FIFO-watermark INT1 interrupt with tagged accel/gyro/hardware-timestamp
+  batch reads.
 - IIO trigger and triggered buffer support with a configurable hardware FIFO
   watermark (default: 4 combined scans).
 - 24-byte buffered scan frame: accel XYZ, gyro XYZ, timestamp.
-- FIFO overflow and I2C error recovery, monotonic batch timestamp
-  reconstruction, FIFO tag-integrity counters, and repeatable buffer
+- Calibrated 32-bit hardware timestamp ticks with rollover extension,
+  backward/gap detection, and mapping into the selected IIO clock domain.
+- Full FIFO overflow and I2C error recovery, explicit data-discontinuity and
+  unknown-loss counters, FIFO tag-integrity checks, and repeatable buffer
   enable/disable rollback.
 - ROS 2 publisher with IIO device auto-detection and launch file support.
+- ROS 2 `/diagnostics` reporting with OK/WARN/ERROR FIFO health states.
 - Parameterized frame ID, stationary gyro-bias correction, and covariance
   loading from a per-board calibration YAML.
 - A manual-start systemd service and one-command IIO-to-ROS validation.
@@ -77,6 +81,9 @@ Observed validation results:
 - The FIFO v2 default watermark 4 delivered about 104 scans/s with 26 IRQ/s;
   its enlarged burst and read-path cleanup kept the FIFO path to two I2C calls
   per IRQ.
+- FIFO v3 parsed the LSM6DSOX hardware timestamp tag at all four supported
+  ODRs. A forced overflow was discarded and recovered with an explicit ROS 2
+  WARN diagnostic instead of synthetic samples.
 
 ## v1.0.0 Release Scope
 
@@ -84,7 +91,7 @@ The v1.0.0 release covers the complete hardware-to-ROS pipeline:
 
 ```text
 Device Tree → I2C probe/regmap → FIFO watermark IRQ → IIO buffer
-           → /dev/iio:deviceX → ROS 2 Imu → systemd service
+           → /dev/iio:deviceX → ROS 2 Imu + diagnostics → systemd service
 ```
 
 Before a deployment or release, run this final board-side acceptance check:
@@ -162,8 +169,10 @@ sudo ./IIO-raw/iio_buffer_reader /dev/iio:device1 20
 
 - The driver is still an out-of-tree learning driver.
 - No runtime PM, suspend/resume handling, or regcache synchronization policy.
-- FIFO timestamps are reconstructed from the watermark IRQ and ODR; the
-  sensor's hardware timestamp tag is not consumed yet.
+- Hardware timestamp rollover extension is implemented but still needs a
+  continuous 30-hour rollover validation run.
+- Forced FIFO overflow is covered; I2C fault injection still needs dedicated
+  adapter-level testing.
 - Accelerometer six-face scale/bias and installation-axis calibration are not
   implemented; stationary accel means are recorded but gravity is not removed.
 - The systemd service is not enabled at boot by default.
