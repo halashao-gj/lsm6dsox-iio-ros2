@@ -34,6 +34,8 @@ robotics-facing data pipeline.
   IIO sysfs commands, register verification, and ROS 2 validation.
 - `docs/runtime-pm-suspend-validation.md`: runtime autosuspend design, direct
   access and buffer PM ownership, deep suspend/resume, and board measurements.
+- `docs/driver-code-reading-guide.md`: Chinese architecture overview and a
+  call-chain-based walkthrough of the complete kernel driver.
 
 ## Implemented features
 
