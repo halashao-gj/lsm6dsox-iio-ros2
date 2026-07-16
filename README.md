@@ -43,10 +43,11 @@ robotics-facing data pipeline.
 - `raw`, `scale`, and `sampling_frequency` IIO attributes.
 - FIFO-watermark INT1 interrupt with tagged accel/gyro batch reads.
 - IIO trigger and triggered buffer support with a configurable hardware FIFO
-  watermark (default: 8 combined scans).
+  watermark (default: 4 combined scans).
 - 24-byte buffered scan frame: accel XYZ, gyro XYZ, timestamp.
 - FIFO overflow and I2C error recovery, monotonic batch timestamp
-  reconstruction, and repeatable buffer enable/disable rollback.
+  reconstruction, FIFO tag-integrity counters, and repeatable buffer
+  enable/disable rollback.
 - ROS 2 publisher with IIO device auto-detection and launch file support.
 - Parameterized frame ID, stationary gyro-bias correction, and covariance
   loading from a per-board calibration YAML.
@@ -72,7 +73,10 @@ Observed validation results:
 - Madgwick filter and rosbag recording were validated on the board.
 - The post-regmap systemd/IIO/ROS validation passed after a clean board reboot.
 - At the same 104 Hz ODR, changing the hardware FIFO watermark from 1 to 8
-  reduced measured IRQs by 88.9% and I2C transfers by 74.8% in 5-second tests.
+  reduced measured IRQs by 88.9% and I2C messages by 74.8% in 5-second tests.
+- The FIFO v2 default watermark 4 delivered about 104 scans/s with 26 IRQ/s;
+  its enlarged burst and read-path cleanup kept the FIFO path to two I2C calls
+  per IRQ.
 
 ## v1.0.0 Release Scope
 
@@ -133,7 +137,7 @@ ros2 launch lsm6dsox_ros imu.launch.py
 ./scripts/disable_lsm6dsox_buffer.sh
 ```
 
-Override the default 128-frame kernel buffer or the default 8-scan hardware
+Override the default 128-frame kernel buffer or the default 4-scan hardware
 FIFO watermark if needed:
 
 ```sh
@@ -142,7 +146,8 @@ FIFO_WATERMARK=4 ./scripts/enable_lsm6dsox_buffer.sh
 ```
 
 The watermark trades batch latency for bus and interrupt overhead. At 104 Hz,
-watermark 8 represents roughly 77 ms of samples per full batch.
+the default watermark 4 represents roughly 38.5 ms of samples per full batch;
+use `FIFO_WATERMARK=2` when lower delivery latency matters more than IRQ rate.
 
 For a manually controlled service that restarts the ROS 2 node after failures,
 see `docs/systemd-deployment.md`. It is deliberately not enabled at boot.

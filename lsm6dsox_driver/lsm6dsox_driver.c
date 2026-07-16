@@ -72,8 +72,8 @@
 #define LSM6DSOX_FIFO_ENTRY_SIZE		7
 #define LSM6DSOX_FIFO_MAX_ENTRIES	512
 #define LSM6DSOX_FIFO_MAX_SCANS		255
-#define LSM6DSOX_FIFO_READ_CHUNK		28
-#define LSM6DSOX_FIFO_DEFAULT_WATERMARK	8
+#define LSM6DSOX_FIFO_TARGET_READ_CHUNK	112
+#define LSM6DSOX_FIFO_DEFAULT_WATERMARK	4
 
 #define LSM6DSOX_SAMP_FREQ_HZ		104
 #define LSM6DSOX_ACCEL_SCALE_UG		61000
@@ -106,9 +106,9 @@ struct lsm6dsox_data {
 	int gyro_odr;
 	unsigned int fifo_watermark;
 	unsigned int fifo_hw_entries;
+	unsigned int fifo_read_chunk;
 	bool buffer_enabled;
 	bool timestamp_valid;
-	s64 irq_timestamp_ns;
 	s64 last_timestamp_ns;
 	u8 *fifo_raw;
 	struct lsm6dsox_scan *fifo_scans;
@@ -116,6 +116,7 @@ struct lsm6dsox_data {
 	atomic_t sample_count;
 	atomic64_t fifo_overflow_count;
 	atomic64_t i2c_error_count;
+	atomic64_t fifo_tag_error_count;
 };
 struct lsm6dsox_scan {
 	s16 accel_x;
@@ -264,7 +265,6 @@ static irqreturn_t lsm6dsox_irq_handler(int irq, void *private)
 	struct iio_dev *indio_dev = private;
 	struct lsm6dsox_data *data = iio_priv(indio_dev);
 
-	data->irq_timestamp_ns = iio_get_time_ns(indio_dev);
 	atomic_inc(&data->irq_count);
 	iio_trigger_poll(data->trig);
 
@@ -279,7 +279,7 @@ static irqreturn_t lsm6dsox_trigger_handler(int irq, void *p)
 	int ret;
 
 	mutex_lock(&data->lock);
-	ret = lsm6dsox_fifo_drain(indio_dev, data->irq_timestamp_ns,
+	ret = lsm6dsox_fifo_drain(indio_dev, pf->timestamp,
 				  LSM6DSOX_FIFO_MAX_SCANS, true);
 	mutex_unlock(&data->lock);
 	if (ret < 0)
@@ -419,7 +419,7 @@ static int lsm6dsox_fifo_read_entries(struct iio_dev *indio_dev,
 
 	while (offset < bytes) {
 		unsigned int chunk = min_t(unsigned int, bytes - offset,
-					       LSM6DSOX_FIFO_READ_CHUNK);
+					       data->fifo_read_chunk);
 
 		ret = regmap_bulk_read(data->regmap,
 				       LSM6DSOX_REG_FIFO_DATA_OUT_TAG,
@@ -439,16 +439,21 @@ static int lsm6dsox_fifo_read_entries(struct iio_dev *indio_dev,
 
 		switch (tag) {
 		case LSM6DSOX_FIFO_GYRO_TAG:
+			if (have_gyro)
+				atomic64_inc(&data->fifo_tag_error_count);
 			lsm6dsox_fifo_decode_xyz(entry + 1, &pending.gyro_x,
 						 &pending.gyro_y, &pending.gyro_z);
 			have_gyro = true;
 			break;
 		case LSM6DSOX_FIFO_ACCEL_TAG:
+			if (have_accel)
+				atomic64_inc(&data->fifo_tag_error_count);
 			lsm6dsox_fifo_decode_xyz(entry + 1, &pending.accel_x,
 						 &pending.accel_y, &pending.accel_z);
 			have_accel = true;
 			break;
 		default:
+			atomic64_inc(&data->fifo_tag_error_count);
 			dev_warn_ratelimited(&data->client->dev,
 					     "unexpected FIFO tag 0x%02x\n", tag);
 			continue;
@@ -461,6 +466,8 @@ static int lsm6dsox_fifo_read_entries(struct iio_dev *indio_dev,
 			have_gyro = false;
 		}
 	}
+	if (have_accel || have_gyro)
+		atomic64_inc(&data->fifo_tag_error_count);
 
 	if (!scan_count)
 		return 0;
@@ -494,10 +501,11 @@ static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev, s64 anchor_ns,
 {
 	struct lsm6dsox_data *data = iio_priv(indio_dev);
 	unsigned int total = 0;
-	int pass;
+	bool first_pass = true;
 
-	for (pass = 0; pass < 4 && total < max_scans; pass++) {
+	while (total < max_scans) {
 		unsigned int entries, scans;
+		bool recheck;
 		u16 status;
 		int ret;
 
@@ -519,19 +527,27 @@ static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev, s64 anchor_ns,
 		if ((status & LSM6DSOX_FIFO_EMPTY) || entries < 2)
 			break;
 
-		if (pass > 0 && entries < data->fifo_hw_entries)
+		if (!first_pass && entries < data->fifo_hw_entries)
 			break;
 
 		scans = min_t(unsigned int, entries / 2, max_scans - total);
 		entries = scans * 2;
+		/*
+		 * A normal watermark batch is fully consumed by this read and will
+		 * deassert INT1. Re-read status only after a delayed handler sees at
+		 * least two complete batches, where arrivals during the larger burst
+		 * could otherwise leave the FIFO above its threshold.
+		 */
+		recheck = scans >= data->fifo_watermark * 2;
 		ret = lsm6dsox_fifo_read_entries(indio_dev, entries, anchor_ns,
-						  watermark_event && pass == 0);
+						  watermark_event && first_pass);
 		if (ret < 0)
 			return ret;
 
 		total += ret;
-		if (ret < scans)
+		if (ret < scans || !recheck)
 			break;
+		first_pass = false;
 	}
 
 	return total;
@@ -601,6 +617,7 @@ static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 		atomic_set(&data->sample_count, 0);
 		atomic64_set(&data->fifo_overflow_count, 0);
 		atomic64_set(&data->i2c_error_count, 0);
+		atomic64_set(&data->fifo_tag_error_count, 0);
 		data->timestamp_valid = false;
 
 		ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
@@ -626,9 +643,9 @@ static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 
 		data->buffer_enabled = true;
 		dev_info(&data->client->dev,
-			 "FIFO enabled: watermark=%u scans (%u tagged entries), ODR=%d Hz\n",
+			 "FIFO enabled: watermark=%u scans (%u tagged entries), ODR=%d Hz, burst=%u bytes\n",
 			 data->fifo_watermark, data->fifo_hw_entries,
-			 data->accel_odr);
+			 data->accel_odr, data->fifo_read_chunk);
 		goto out;
 
 err_bypass:
@@ -662,11 +679,12 @@ static int lsm6dsox_buffer_predisable(struct iio_dev *indio_dev)
 		data->buffer_enabled = false;
 		data->timestamp_valid = false;
 		dev_info(&data->client->dev,
-			 "FIFO disabled: irqs=%d samples=%d overflows=%lld i2c_errors=%lld\n",
+			 "FIFO disabled: irqs=%d samples=%d overflows=%lld i2c_errors=%lld tag_errors=%lld\n",
 			 atomic_read(&data->irq_count),
 			 atomic_read(&data->sample_count),
 			 atomic64_read(&data->fifo_overflow_count),
-			 atomic64_read(&data->i2c_error_count));
+			 atomic64_read(&data->i2c_error_count),
+			 atomic64_read(&data->fifo_tag_error_count));
 	}
 	mutex_unlock(&data->lock);
 
@@ -1013,30 +1031,17 @@ static int lsm6dsox_hwfifo_set_watermark(struct iio_dev *indio_dev,
 					 unsigned int val)
 {
 	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	int ret = 0;
+
+	if (val < 1 || val > LSM6DSOX_FIFO_MAX_SCANS)
+		return -EINVAL;
 
 	mutex_lock(&data->lock);
-	data->fifo_watermark = clamp_val(val, 1, LSM6DSOX_FIFO_MAX_SCANS);
+	if (data->buffer_enabled)
+		ret = -EBUSY;
+	else
+		data->fifo_watermark = val;
 	mutex_unlock(&data->lock);
-	return 0;
-}
-
-static int lsm6dsox_hwfifo_flush_to_buffer(struct iio_dev *indio_dev,
-					   unsigned int count)
-{
-	struct lsm6dsox_data *data = iio_priv(indio_dev);
-	int ret;
-
-	ret = iio_device_claim_buffer_mode(indio_dev);
-	if (ret)
-		return ret;
-
-	mutex_lock(&data->lock);
-	ret = lsm6dsox_fifo_drain(indio_dev, iio_get_time_ns(indio_dev),
-				  min_t(unsigned int, count,
-					LSM6DSOX_FIFO_MAX_SCANS), false);
-	mutex_unlock(&data->lock);
-
-	iio_device_release_buffer_mode(indio_dev);
 	return ret;
 }
 
@@ -1061,14 +1066,58 @@ static ssize_t hwfifo_watermark_max_show(struct device *dev,
 	return sysfs_emit(buf, "%u\n", LSM6DSOX_FIFO_MAX_SCANS);
 }
 
+static ssize_t hwfifo_overflow_count_show(struct device *dev,
+					  struct device_attribute *attr, char *buf)
+{
+	struct lsm6dsox_data *data = iio_priv(dev_to_iio_dev(dev));
+
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&data->fifo_overflow_count));
+}
+
+static ssize_t hwfifo_i2c_error_count_show(struct device *dev,
+					   struct device_attribute *attr, char *buf)
+{
+	struct lsm6dsox_data *data = iio_priv(dev_to_iio_dev(dev));
+
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&data->i2c_error_count));
+}
+
+static ssize_t hwfifo_tag_error_count_show(struct device *dev,
+					   struct device_attribute *attr, char *buf)
+{
+	struct lsm6dsox_data *data = iio_priv(dev_to_iio_dev(dev));
+
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&data->fifo_tag_error_count));
+}
+
+static ssize_t hwfifo_read_chunk_bytes_show(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	struct lsm6dsox_data *data = iio_priv(dev_to_iio_dev(dev));
+
+	return sysfs_emit(buf, "%u\n", data->fifo_read_chunk);
+}
+
 static IIO_DEVICE_ATTR_RO(hwfifo_watermark, 0);
 static IIO_DEVICE_ATTR_RO(hwfifo_watermark_min, 0);
 static IIO_DEVICE_ATTR_RO(hwfifo_watermark_max, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_overflow_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_i2c_error_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_tag_error_count, 0);
+static IIO_DEVICE_ATTR_RO(hwfifo_read_chunk_bytes, 0);
 
 static const struct attribute *lsm6dsox_fifo_attributes[] = {
 	&iio_dev_attr_hwfifo_watermark.dev_attr.attr,
 	&iio_dev_attr_hwfifo_watermark_min.dev_attr.attr,
 	&iio_dev_attr_hwfifo_watermark_max.dev_attr.attr,
+	&iio_dev_attr_hwfifo_overflow_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_i2c_error_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_tag_error_count.dev_attr.attr,
+	&iio_dev_attr_hwfifo_read_chunk_bytes.dev_attr.attr,
 	NULL,
 };
 
@@ -1078,11 +1127,11 @@ static const struct iio_info lsm6dsox_iio_info = {
 	.write_raw = lsm6dsox_write_raw,
 	.validate_trigger = lsm6dsox_validate_trigger,
 	.hwfifo_set_watermark = lsm6dsox_hwfifo_set_watermark,
-	.hwfifo_flush_to_buffer = lsm6dsox_hwfifo_flush_to_buffer,
 };
 
 static int lsm6dsox_probe(struct i2c_client *client)
 {
+	const struct i2c_adapter_quirks *quirks = client->adapter->quirks;
 	struct lsm6dsox_data *data;
 	struct iio_dev *indio_dev;
 	s16 ax, ay, az;
@@ -1105,6 +1154,26 @@ static int lsm6dsox_probe(struct i2c_client *client)
 
 	data = iio_priv(indio_dev);
 	data->client = client;
+	data->fifo_read_chunk = LSM6DSOX_FIFO_TARGET_READ_CHUNK;
+	if (quirks && quirks->max_read_len)
+		data->fifo_read_chunk = min_t(unsigned int,
+						 data->fifo_read_chunk,
+						 quirks->max_read_len);
+	if (quirks && quirks->max_comb_2nd_msg_len)
+		data->fifo_read_chunk = min_t(unsigned int,
+						 data->fifo_read_chunk,
+						 quirks->max_comb_2nd_msg_len);
+	data->fifo_read_chunk -= data->fifo_read_chunk %
+				 LSM6DSOX_FIFO_ENTRY_SIZE;
+	if (data->fifo_read_chunk < LSM6DSOX_FIFO_ENTRY_SIZE) {
+		dev_err(&client->dev,
+			"I2C adapter cannot read one %u-byte FIFO entry\n",
+			LSM6DSOX_FIFO_ENTRY_SIZE);
+		return -EOPNOTSUPP;
+	}
+	dev_info(&client->dev, "FIFO burst read size: %u bytes\n",
+		 data->fifo_read_chunk);
+
 	data->regmap = devm_regmap_init_i2c(client, &lsm6dsox_regmap_config);
 	if (IS_ERR(data->regmap)) {
 		ret = PTR_ERR(data->regmap);
