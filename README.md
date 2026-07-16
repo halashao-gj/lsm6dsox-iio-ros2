@@ -28,6 +28,8 @@ robotics-facing data pipeline.
   parameters, and frame configuration.
 - `docs/regmap-refactor.md`: rationale, migration mapping, and validation for
   the driver register-access refactor.
+- `docs/performance/fifo-watermark-validation.md`: hardware FIFO design,
+  correctness checks, and watermark 1 versus 8 performance measurements.
 
 ## Implemented features
 
@@ -35,12 +37,16 @@ robotics-facing data pipeline.
 - I2C probe with `WHO_AM_I=0x6c` verification.
 - Standard `regmap-i2c` register access with read, write, masked update, and
   bulk-read paths.
-- Software reset, BDU enable, and 104 Hz accel/gyro configuration.
+- Software reset, BDU enable, and coherent 26/52/104/208 Hz accel/gyro ODR
+  configuration through IIO sysfs.
 - IIO accel and angular velocity channels for X/Y/Z axes.
 - `raw`, `scale`, and `sampling_frequency` IIO attributes.
-- Data-ready INT1 interrupt routed to a threaded IRQ.
-- IIO trigger and triggered buffer support.
+- FIFO-watermark INT1 interrupt with tagged accel/gyro batch reads.
+- IIO trigger and triggered buffer support with a configurable hardware FIFO
+  watermark (default: 8 combined scans).
 - 24-byte buffered scan frame: accel XYZ, gyro XYZ, timestamp.
+- FIFO overflow and I2C error recovery, monotonic batch timestamp
+  reconstruction, and repeatable buffer enable/disable rollback.
 - ROS 2 publisher with IIO device auto-detection and launch file support.
 - Parameterized frame ID, stationary gyro-bias correction, and covariance
   loading from a per-board calibration YAML.
@@ -65,13 +71,15 @@ Observed validation results:
   published `/imu/data` at about `102.5 Hz`.
 - Madgwick filter and rosbag recording were validated on the board.
 - The post-regmap systemd/IIO/ROS validation passed after a clean board reboot.
+- At the same 104 Hz ODR, changing the hardware FIFO watermark from 1 to 8
+  reduced measured IRQs by 88.9% and I2C transfers by 74.8% in 5-second tests.
 
 ## v1.0.0 Release Scope
 
 The v1.0.0 release covers the complete hardware-to-ROS pipeline:
 
 ```text
-Device Tree → I2C probe/regmap → INT1 IRQ → IIO triggered buffer
+Device Tree → I2C probe/regmap → FIFO watermark IRQ → IIO buffer
            → /dev/iio:deviceX → ROS 2 Imu → systemd service
 ```
 
@@ -125,11 +133,16 @@ ros2 launch lsm6dsox_ros imu.launch.py
 ./scripts/disable_lsm6dsox_buffer.sh
 ```
 
-Override the default 128-frame kernel buffer if needed:
+Override the default 128-frame kernel buffer or the default 8-scan hardware
+FIFO watermark if needed:
 
 ```sh
 BUFFER_LENGTH=256 ./scripts/enable_lsm6dsox_buffer.sh
+FIFO_WATERMARK=4 ./scripts/enable_lsm6dsox_buffer.sh
 ```
+
+The watermark trades batch latency for bus and interrupt overhead. At 104 Hz,
+watermark 8 represents roughly 77 ms of samples per full batch.
 
 For a manually controlled service that restarts the ROS 2 node after failures,
 see `docs/systemd-deployment.md`. It is deliberately not enabled at boot.
@@ -143,8 +156,9 @@ sudo ./IIO-raw/iio_buffer_reader /dev/iio:device1 20
 ## Current limitations
 
 - The driver is still an out-of-tree learning driver.
-- No hardware FIFO or FIFO watermark support.
 - No runtime PM, suspend/resume handling, or regcache synchronization policy.
+- FIFO timestamps are reconstructed from the watermark IRQ and ODR; the
+  sensor's hardware timestamp tag is not consumed yet.
 - Accelerometer six-face scale/bias and installation-axis calibration are not
   implemented; stationary accel means are recorded but gravity is not removed.
 - The systemd service is not enabled at boot by default.

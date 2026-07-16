@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Enable the LSM6DSOX IIO triggered buffer for the ROS 2 publisher.
+# Enable the LSM6DSOX hardware-FIFO IIO buffer for the ROS 2 publisher.
 set -euo pipefail
 
 DEVICE_NAME="${DEVICE_NAME:-lsm6dsox}"
 BUFFER_LENGTH="${BUFFER_LENGTH:-128}"
+FIFO_WATERMARK="${FIFO_WATERMARK:-8}"
 TRIGGER_NAME="${TRIGGER_NAME:-}"
 IIO_ROOT=/sys/bus/iio/devices
 
 if ! [[ "$BUFFER_LENGTH" =~ ^[1-9][0-9]*$ ]]; then
   echo "BUFFER_LENGTH must be a positive integer, got: $BUFFER_LENGTH" >&2
+  exit 1
+fi
+
+if ! [[ "$FIFO_WATERMARK" =~ ^[1-9][0-9]*$ ]] ||
+   (( FIFO_WATERMARK > 255 )); then
+  echo "FIFO_WATERMARK must be between 1 and 255, got: $FIFO_WATERMARK" >&2
   exit 1
 fi
 
@@ -64,6 +71,7 @@ done
 
 write_sysfs "$TRIGGER_NAME" "$iio_device/trigger/current_trigger"
 write_sysfs "$BUFFER_LENGTH" "$iio_device/buffer/length"
+write_sysfs "$FIFO_WATERMARK" "$iio_device/buffer/watermark"
 write_sysfs 1 "$iio_device/buffer/enable"
 
 if [[ ! -r "$device_node" ]]; then
@@ -77,4 +85,6 @@ echo "  device:  $iio_device"
 echo "  node:    $device_node"
 echo "  trigger: $(<"$iio_device/trigger/current_trigger")"
 echo "  length:  $(<"$iio_device/buffer/length")"
+echo "  watermark: $(<"$iio_device/buffer/watermark")"
+echo "  hw watermark: $(<"$iio_device/buffer/hwfifo_watermark")"
 echo "  state:   $(<"$iio_device/buffer/enable")"
