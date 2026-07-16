@@ -98,6 +98,11 @@ struct lsm6dsox_odr_entry {
 	u8 value;
 };
 
+struct lsm6dsox_fs_entry {
+	int scale_nano;
+	u8 value;
+};
+
 static const struct lsm6dsox_odr_entry lsm6dsox_odr_table[] = {
 	{ 26,  0x2 << 4 },
 	{ 52,  0x3 << 4 },
@@ -107,6 +112,36 @@ static const struct lsm6dsox_odr_entry lsm6dsox_odr_table[] = {
 
 static const int lsm6dsox_odr_available[] = { 26, 52, 104, 208 };
 
+static const struct lsm6dsox_fs_entry lsm6dsox_accel_fs_table[] = {
+	{ IIO_G_TO_M_S_2(61000),  0x0 << 2 }, /* +/-2 g */
+	{ IIO_G_TO_M_S_2(122000), 0x2 << 2 }, /* +/-4 g */
+	{ IIO_G_TO_M_S_2(244000), 0x3 << 2 }, /* +/-8 g */
+	{ IIO_G_TO_M_S_2(488000), 0x1 << 2 }, /* +/-16 g */
+};
+
+static const struct lsm6dsox_fs_entry lsm6dsox_gyro_fs_table[] = {
+	{ IIO_DEGREE_TO_RAD(4375000), BIT(1) },  /* +/-125 dps */
+	{ IIO_DEGREE_TO_RAD(8750000), 0x0 << 2 }, /* +/-250 dps */
+	{ IIO_DEGREE_TO_RAD(17500000), 0x1 << 2 }, /* +/-500 dps */
+	{ IIO_DEGREE_TO_RAD(35000000), 0x2 << 2 }, /* +/-1000 dps */
+	{ IIO_DEGREE_TO_RAD(70000000), 0x3 << 2 }, /* +/-2000 dps */
+};
+
+static const int lsm6dsox_accel_scale_available[][2] = {
+	{ 0, IIO_G_TO_M_S_2(61000) },
+	{ 0, IIO_G_TO_M_S_2(122000) },
+	{ 0, IIO_G_TO_M_S_2(244000) },
+	{ 0, IIO_G_TO_M_S_2(488000) },
+};
+
+static const int lsm6dsox_gyro_scale_available[][2] = {
+	{ 0, IIO_DEGREE_TO_RAD(4375000) },
+	{ 0, IIO_DEGREE_TO_RAD(8750000) },
+	{ 0, IIO_DEGREE_TO_RAD(17500000) },
+	{ 0, IIO_DEGREE_TO_RAD(35000000) },
+	{ 0, IIO_DEGREE_TO_RAD(70000000) },
+};
+
 struct lsm6dsox_data {
 	struct i2c_client *client;
 	struct regmap *regmap;
@@ -114,6 +149,8 @@ struct lsm6dsox_data {
 	struct mutex lock;
 	int accel_odr;
 	int gyro_odr;
+	int accel_scale_nano;
+	int gyro_scale_nano;
 	unsigned int fifo_watermark;
 	unsigned int fifo_hw_entries;
 	unsigned int fifo_read_chunk;
@@ -175,7 +212,8 @@ static const struct iio_chan_spec lsm6dsox_channels[] = {
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |
 					    BIT(IIO_CHAN_INFO_SAMP_FREQ),
 		.info_mask_shared_by_type_available =
-			BIT(IIO_CHAN_INFO_SAMP_FREQ),
+			BIT(IIO_CHAN_INFO_SAMP_FREQ) |
+			BIT(IIO_CHAN_INFO_SCALE),
 		.scan_index = 0,
 		.scan_type = {
 			.sign = 's',
@@ -193,7 +231,8 @@ static const struct iio_chan_spec lsm6dsox_channels[] = {
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |
 					    BIT(IIO_CHAN_INFO_SAMP_FREQ),
 		.info_mask_shared_by_type_available =
-			BIT(IIO_CHAN_INFO_SAMP_FREQ),
+			BIT(IIO_CHAN_INFO_SAMP_FREQ) |
+			BIT(IIO_CHAN_INFO_SCALE),
 		.scan_index = 1,
 		.scan_type = {
 			.sign = 's',
@@ -211,7 +250,8 @@ static const struct iio_chan_spec lsm6dsox_channels[] = {
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |
 					    BIT(IIO_CHAN_INFO_SAMP_FREQ),
 		.info_mask_shared_by_type_available =
-			BIT(IIO_CHAN_INFO_SAMP_FREQ),
+			BIT(IIO_CHAN_INFO_SAMP_FREQ) |
+			BIT(IIO_CHAN_INFO_SCALE),
 		.scan_index = 2,
 		.scan_type = {
 			.sign = 's',
@@ -229,7 +269,8 @@ static const struct iio_chan_spec lsm6dsox_channels[] = {
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |
 					    BIT(IIO_CHAN_INFO_SAMP_FREQ),
 		.info_mask_shared_by_type_available =
-			BIT(IIO_CHAN_INFO_SAMP_FREQ),
+			BIT(IIO_CHAN_INFO_SAMP_FREQ) |
+			BIT(IIO_CHAN_INFO_SCALE),
 		.scan_index = 3,
 		.scan_type = {
 			.sign = 's',
@@ -247,7 +288,8 @@ static const struct iio_chan_spec lsm6dsox_channels[] = {
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |
 					    BIT(IIO_CHAN_INFO_SAMP_FREQ),
 		.info_mask_shared_by_type_available =
-			BIT(IIO_CHAN_INFO_SAMP_FREQ),
+			BIT(IIO_CHAN_INFO_SAMP_FREQ) |
+			BIT(IIO_CHAN_INFO_SCALE),
 		.scan_index = 4,
 		.scan_type = {
 			.sign = 's',
@@ -265,7 +307,8 @@ static const struct iio_chan_spec lsm6dsox_channels[] = {
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) |
 					    BIT(IIO_CHAN_INFO_SAMP_FREQ),
 		.info_mask_shared_by_type_available =
-			BIT(IIO_CHAN_INFO_SAMP_FREQ),
+			BIT(IIO_CHAN_INFO_SAMP_FREQ) |
+			BIT(IIO_CHAN_INFO_SCALE),
 		.scan_index = 5,
 		.scan_type = {
 			.sign = 's',
@@ -1129,6 +1172,77 @@ static int lsm6dsox_set_odr(struct lsm6dsox_data *data,
 	return 0;
 }
 
+static int lsm6dsox_set_full_scale(struct lsm6dsox_data *data,
+				   enum iio_chan_type type, int scale_nano)
+{
+	const struct lsm6dsox_fs_entry *table;
+	const struct lsm6dsox_fs_entry *new_fs = NULL, *old_fs = NULL;
+	struct device *dev = &data->client->dev;
+	int *cached_scale;
+	unsigned int value;
+	unsigned int table_size;
+	u8 reg, mask;
+	int ret, rollback_ret;
+	unsigned int i;
+
+	if (type == IIO_ACCEL) {
+		table = lsm6dsox_accel_fs_table;
+		table_size = ARRAY_SIZE(lsm6dsox_accel_fs_table);
+		cached_scale = &data->accel_scale_nano;
+		reg = LSM6DSOX_REG_CTRL1_XL;
+		mask = LSM6DSOX_FS_XL_MASK;
+	} else if (type == IIO_ANGL_VEL) {
+		table = lsm6dsox_gyro_fs_table;
+		table_size = ARRAY_SIZE(lsm6dsox_gyro_fs_table);
+		cached_scale = &data->gyro_scale_nano;
+		reg = LSM6DSOX_REG_CTRL2_G;
+		mask = LSM6DSOX_FS_G_MASK | LSM6DSOX_FS_125_MASK;
+	} else {
+		return -EINVAL;
+	}
+
+	for (i = 0; i < table_size; i++) {
+		if (table[i].scale_nano == scale_nano)
+			new_fs = &table[i];
+		if (table[i].scale_nano == *cached_scale)
+			old_fs = &table[i];
+	}
+
+	if (!new_fs || !old_fs)
+		return -EINVAL;
+	if (new_fs == old_fs)
+		return 0;
+
+	ret = regmap_update_bits(data->regmap, reg, mask, new_fs->value);
+	if (ret < 0)
+		goto rollback;
+
+	ret = regmap_read(data->regmap, reg, &value);
+	if (ret < 0)
+		goto rollback;
+
+	if ((value & mask) != new_fs->value) {
+		dev_err(dev,
+			"failed to verify scale 0.%09d, register 0x%02x=0x%02x\n",
+			scale_nano, reg, value);
+		ret = -EIO;
+		goto rollback;
+	}
+
+	*cached_scale = scale_nano;
+	dev_info(dev, "scale set to 0.%09d, register 0x%02x=0x%02x\n",
+		 scale_nano, reg, value);
+	return 0;
+
+rollback:
+	rollback_ret = regmap_update_bits(data->regmap, reg, mask,
+					  old_fs->value);
+	if (rollback_ret < 0)
+		dev_err(dev, "failed to roll back scale at register 0x%02x: %d\n",
+			reg, rollback_ret);
+	return ret;
+}
+
 static int lsm6dsox_read_xyz(struct lsm6dsox_data *data, u8 start_reg,
 			     s16 *x, s16 *y, s16 *z)
 {
@@ -1184,9 +1298,9 @@ static int lsm6dsox_read_raw(struct iio_dev *indio_dev,
 		*val = 0;
 
 		if (chan->type == IIO_ACCEL)
-			*val2 = IIO_G_TO_M_S_2(LSM6DSOX_ACCEL_SCALE_UG);
+			*val2 = data->accel_scale_nano;
 		else if (chan->type == IIO_ANGL_VEL)
-			*val2 = IIO_DEGREE_TO_RAD(LSM6DSOX_GYRO_SCALE_UDPS);
+			*val2 = data->gyro_scale_nano;
 		else
 			return -EINVAL;
 
@@ -1212,13 +1326,41 @@ static int lsm6dsox_read_avail(struct iio_dev *indio_dev,
 			       const int **vals, int *type, int *length,
 			       long mask)
 {
-	if (mask != IIO_CHAN_INFO_SAMP_FREQ)
+	if (mask == IIO_CHAN_INFO_SAMP_FREQ) {
+		*vals = lsm6dsox_odr_available;
+		*type = IIO_VAL_INT;
+		*length = ARRAY_SIZE(lsm6dsox_odr_available);
+		return IIO_AVAIL_LIST;
+	}
+
+	if (mask != IIO_CHAN_INFO_SCALE)
 		return -EINVAL;
 
-	*vals = lsm6dsox_odr_available;
-	*type = IIO_VAL_INT;
-	*length = ARRAY_SIZE(lsm6dsox_odr_available);
+	*type = IIO_VAL_INT_PLUS_NANO;
+	if (chan->type == IIO_ACCEL) {
+		*vals = (const int *)lsm6dsox_accel_scale_available;
+		*length = ARRAY_SIZE(lsm6dsox_accel_scale_available) * 2;
+	} else if (chan->type == IIO_ANGL_VEL) {
+		*vals = (const int *)lsm6dsox_gyro_scale_available;
+		*length = ARRAY_SIZE(lsm6dsox_gyro_scale_available) * 2;
+	} else {
+		return -EINVAL;
+	}
+
 	return IIO_AVAIL_LIST;
+}
+
+static int lsm6dsox_write_raw_get_fmt(struct iio_dev *indio_dev,
+				      const struct iio_chan_spec *chan,
+				      long mask)
+{
+	if (mask == IIO_CHAN_INFO_SCALE &&
+	    (chan->type == IIO_ACCEL || chan->type == IIO_ANGL_VEL))
+		return IIO_VAL_INT_PLUS_NANO;
+	if (mask == IIO_CHAN_INFO_SAMP_FREQ)
+		return IIO_VAL_INT;
+
+	return -EINVAL;
 }
 
 static int lsm6dsox_write_raw(struct iio_dev *indio_dev,
@@ -1229,7 +1371,11 @@ static int lsm6dsox_write_raw(struct iio_dev *indio_dev,
 	int old_accel_odr, old_gyro_odr;
 	int ret;
 
-	if (mask != IIO_CHAN_INFO_SAMP_FREQ || val2 != 0)
+	if (mask == IIO_CHAN_INFO_SAMP_FREQ && val2 != 0)
+		return -EINVAL;
+	if (mask == IIO_CHAN_INFO_SCALE && val != 0)
+		return -EINVAL;
+	if (mask != IIO_CHAN_INFO_SAMP_FREQ && mask != IIO_CHAN_INFO_SCALE)
 		return -EINVAL;
 
 	ret = iio_device_claim_direct_mode(indio_dev);
@@ -1237,17 +1383,22 @@ static int lsm6dsox_write_raw(struct iio_dev *indio_dev,
 		return ret;
 
 	mutex_lock(&data->lock);
+	if (mask == IIO_CHAN_INFO_SCALE) {
+		ret = lsm6dsox_set_full_scale(data, chan->type, val2);
+		goto out_unlock;
+	}
+
 	old_accel_odr = data->accel_odr;
 	old_gyro_odr = data->gyro_odr;
 	ret = lsm6dsox_set_odr(data, IIO_ACCEL, val);
 	if (ret)
-		goto rollback;
+		goto odr_rollback;
 
 	ret = lsm6dsox_set_odr(data, IIO_ANGL_VEL, val);
 	if (!ret)
 		goto out_unlock;
 
-rollback:
+odr_rollback:
 	if (lsm6dsox_set_odr(data, IIO_ACCEL, old_accel_odr))
 		dev_err(&data->client->dev, "failed to roll back accel ODR\n");
 	if (lsm6dsox_set_odr(data, IIO_ANGL_VEL, old_gyro_odr))
@@ -1419,6 +1570,7 @@ static const struct iio_info lsm6dsox_iio_info = {
 	.read_raw = lsm6dsox_read_raw,
 	.read_avail = lsm6dsox_read_avail,
 	.write_raw = lsm6dsox_write_raw,
+	.write_raw_get_fmt = lsm6dsox_write_raw_get_fmt,
 	.validate_trigger = lsm6dsox_validate_trigger,
 	.hwfifo_set_watermark = lsm6dsox_hwfifo_set_watermark,
 };
@@ -1550,6 +1702,10 @@ static int lsm6dsox_probe(struct i2c_client *client)
 	mutex_init(&data->lock);
 	data->accel_odr = LSM6DSOX_SAMP_FREQ_HZ;
 	data->gyro_odr = LSM6DSOX_SAMP_FREQ_HZ;
+	data->accel_scale_nano =
+		IIO_G_TO_M_S_2(LSM6DSOX_ACCEL_SCALE_UG);
+	data->gyro_scale_nano =
+		IIO_DEGREE_TO_RAD(LSM6DSOX_GYRO_SCALE_UDPS);
 	data->fifo_watermark = LSM6DSOX_FIFO_DEFAULT_WATERMARK;
 
 	indio_dev->name = "lsm6dsox";

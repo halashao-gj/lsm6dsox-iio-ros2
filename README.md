@@ -30,6 +30,8 @@ robotics-facing data pipeline.
   the driver register-access refactor.
 - `docs/performance/fifo-watermark-validation.md`: hardware FIFO design,
   correctness checks, and watermark 1 versus 8 performance measurements.
+- `docs/dynamic-scale-validation.md`: runtime accel/gyro full-scale mappings,
+  IIO sysfs commands, register verification, and ROS 2 validation.
 
 ## Implemented features
 
@@ -39,6 +41,8 @@ robotics-facing data pipeline.
   bulk-read paths.
 - Software reset, BDU enable, and coherent 26/52/104/208 Hz accel/gyro ODR
   configuration through IIO sysfs.
+- Runtime IIO scale configuration for accel +/-2/4/8/16 g and gyro
+  +/-125/250/500/1000/2000 dps, with register verification and rollback.
 - IIO accel and angular velocity channels for X/Y/Z axes.
 - `raw`, `scale`, and `sampling_frequency` IIO attributes.
 - FIFO-watermark INT1 interrupt with tagged accel/gyro/hardware-timestamp
@@ -84,6 +88,9 @@ Observed validation results:
 - FIFO v3 parsed the LSM6DSOX hardware timestamp tag at all four supported
   ODRs. A forced overflow was discarded and recovered with an explicit ROS 2
   WARN diagnostic instead of synthetic samples.
+- All four accel and five gyro scales were written and verified against
+  `CTRL1_XL`/`CTRL2_G`; invalid and active-buffer writes were rejected without
+  changing the previous scale.
 
 ## v1.0.0 Release Scope
 
@@ -156,6 +163,16 @@ The watermark trades batch latency for bus and interrupt overhead. At 104 Hz,
 the default watermark 4 represents roughly 38.5 ms of samples per full batch;
 use `FIFO_WATERMARK=2` when lower delivery latency matters more than IRQ rate.
 
+Set sensor full scale while the buffer is disabled. IIO exposes SI scale per
+raw LSB, so use a value listed by the corresponding `_available` attribute:
+
+```sh
+cat /sys/bus/iio/devices/iio:device1/in_accel_scale_available
+cat /sys/bus/iio/devices/iio:device1/in_anglvel_scale_available
+echo 0.004785645 | sudo tee \
+  /sys/bus/iio/devices/iio:device1/in_accel_scale
+```
+
 For a manually controlled service that restarts the ROS 2 node after failures,
 see `docs/systemd-deployment.md`. It is deliberately not enabled at boot.
 
@@ -173,6 +190,7 @@ sudo ./IIO-raw/iio_buffer_reader /dev/iio:device1 20
   continuous 30-hour rollover validation run.
 - Forced FIFO overflow is covered; I2C fault injection still needs dedicated
   adapter-level testing.
-- Accelerometer six-face scale/bias and installation-axis calibration are not
-  implemented; stationary accel means are recorded but gravity is not removed.
+- Accelerometer six-face bias calibration and installation-axis calibration
+  are not implemented; stationary accel means are recorded but gravity is not
+  removed.
 - The systemd service is not enabled at boot by default.
