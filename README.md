@@ -32,6 +32,8 @@ robotics-facing data pipeline.
   correctness checks, and watermark 1 versus 8 performance measurements.
 - `docs/dynamic-scale-validation.md`: runtime accel/gyro full-scale mappings,
   IIO sysfs commands, register verification, and ROS 2 validation.
+- `docs/runtime-pm-suspend-validation.md`: runtime autosuspend design, direct
+  access and buffer PM ownership, deep suspend/resume, and board measurements.
 
 ## Implemented features
 
@@ -55,6 +57,11 @@ robotics-facing data pipeline.
 - Full FIFO overflow and I2C error recovery, explicit data-discontinuity and
   unknown-loss counters, FIFO tag-integrity checks, and repeatable buffer
   enable/disable rollback.
+- Runtime PM with a 2-second autosuspend delay, direct-access reference
+  handling, ODR power-down, and buffer-lifetime PM ownership.
+- Deep system suspend/resume with IRQ synchronization, cached ODR/scale and
+  FIFO restoration, bounded I2C resume retries, and explicit discontinuity
+  reporting.
 - ROS 2 publisher with IIO device auto-detection and launch file support.
 - ROS 2 `/diagnostics` reporting with OK/WARN/ERROR FIFO health states.
 - Parameterized frame ID, stationary gyro-bias correction, and covariance
@@ -91,6 +98,12 @@ Observed validation results:
 - All four accel and five gyro scales were written and verified against
   `CTRL1_XL`/`CTRL2_G`; invalid and active-buffer writes were rejected without
   changing the previous scale.
+- Runtime idle powered down accel, gyro, and timestamp registers; raw access
+  woke them and buffer enable held a PM reference until buffer disable.
+- Deep suspend/resume passed with the buffer both disabled and enabled. The
+  active test restored 52 Hz, maximum accel/gyro ranges, watermark 4, FIFO and
+  INT1, then continued streaming without overflow, backward timestamps, or
+  unreported discontinuity.
 
 ## v1.0.0 Release Scope
 
@@ -185,7 +198,8 @@ sudo ./IIO-raw/iio_buffer_reader /dev/iio:device1 20
 ## Current limitations
 
 - The driver is still an out-of-tree learning driver.
-- No runtime PM, suspend/resume handling, or regcache synchronization policy.
+- The board image's `iio-sensor-proxy` periodically reads raw channels and can
+  keep postponing autosuspend; stop it when measuring true idle power.
 - Hardware timestamp rollover extension is implemented but still needs a
   continuous 30-hour rollover validation run.
 - Forced FIFO overflow is covered; I2C fault injection still needs dedicated

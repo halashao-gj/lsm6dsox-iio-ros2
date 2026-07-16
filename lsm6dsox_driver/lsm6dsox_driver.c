@@ -12,6 +12,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/atomic.h>
 #include <linux/interrupt.h>
@@ -92,6 +93,9 @@
 #define LSM6DSOX_STARTUP_DELAY_MS	20
 #define LSM6DSOX_INT1_RETRIES		3
 #define LSM6DSOX_INT1_RETRY_DELAY_MS	20
+#define LSM6DSOX_RESUME_RETRIES		3
+#define LSM6DSOX_RESUME_RETRY_DELAY_MS	20
+#define LSM6DSOX_AUTOSUSPEND_DELAY_MS	2000
 
 struct lsm6dsox_odr_entry {
 	int hz;
@@ -155,7 +159,9 @@ struct lsm6dsox_data {
 	unsigned int fifo_hw_entries;
 	unsigned int fifo_read_chunk;
 	bool buffer_enabled;
+	bool fifo_running;
 	bool fifo_faulted;
+	bool irq_disabled_for_suspend;
 	bool timestamp_valid;
 	bool hw_timestamp_valid;
 	u32 last_hw_timestamp;
@@ -327,6 +333,8 @@ static const unsigned long lsm6dsox_scan_masks[] = {
 
 static int lsm6dsox_fifo_drain(struct iio_dev *indio_dev,
 			       unsigned int max_scans);
+static int lsm6dsox_config_int1_fifo(struct lsm6dsox_data *data);
+static int lsm6dsox_disable_int1_fifo(struct lsm6dsox_data *data);
 
 static irqreturn_t lsm6dsox_irq_handler(int irq, void *private)
 {
@@ -462,6 +470,79 @@ static int lsm6dsox_reset_hw_timestamp(struct iio_dev *indio_dev)
 	return 0;
 }
 
+static int lsm6dsox_fifo_start_hw(struct iio_dev *indio_dev)
+{
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	int ret;
+
+	if (data->fifo_running)
+		return 0;
+
+	ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+	if (ret < 0)
+		return ret;
+
+	ret = lsm6dsox_fifo_set_batching(data, true);
+	if (ret < 0)
+		return ret;
+
+	ret = lsm6dsox_fifo_set_timestamp_batching(data, true);
+	if (ret < 0)
+		goto err_disable_batching;
+
+	ret = lsm6dsox_fifo_program_watermark(data);
+	if (ret < 0)
+		goto err_disable_timestamp;
+
+	ret = lsm6dsox_reset_hw_timestamp(indio_dev);
+	if (ret < 0)
+		goto err_disable_timestamp;
+
+	ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_CONTINUOUS);
+	if (ret < 0)
+		goto err_disable_timestamp;
+
+	ret = lsm6dsox_config_int1_fifo(data);
+	if (ret < 0)
+		goto err_bypass;
+
+	data->fifo_running = true;
+	return 0;
+
+err_bypass:
+	lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+err_disable_timestamp:
+	lsm6dsox_fifo_set_timestamp_batching(data, false);
+err_disable_batching:
+	lsm6dsox_fifo_set_batching(data, false);
+	return ret;
+}
+
+static int lsm6dsox_fifo_stop_hw(struct lsm6dsox_data *data)
+{
+	int first_error = 0;
+	int ret;
+
+	ret = lsm6dsox_disable_int1_fifo(data);
+	if (ret < 0)
+		first_error = ret;
+
+	ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+	if (ret < 0 && !first_error)
+		first_error = ret;
+
+	ret = lsm6dsox_fifo_set_batching(data, false);
+	if (ret < 0 && !first_error)
+		first_error = ret;
+
+	ret = lsm6dsox_fifo_set_timestamp_batching(data, false);
+	if (ret < 0 && !first_error)
+		first_error = ret;
+
+	data->fifo_running = false;
+	return first_error;
+}
+
 static int lsm6dsox_fifo_recover(struct iio_dev *indio_dev)
 {
 	struct lsm6dsox_data *data = iio_priv(indio_dev);
@@ -481,6 +562,7 @@ static int lsm6dsox_fifo_recover(struct iio_dev *indio_dev)
 	ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
 	if (ret < 0)
 		goto fail;
+	data->fifo_running = false;
 
 	ret = lsm6dsox_fifo_set_batching(data, false);
 	if (ret < 0)
@@ -518,12 +600,14 @@ static int lsm6dsox_fifo_recover(struct iio_dev *indio_dev)
 	}
 
 	data->fifo_faulted = false;
+	data->fifo_running = true;
 	return 0;
 
 fail:
 	atomic64_inc(&data->fifo_recovery_failure_count);
 	lsm6dsox_write_int1_ctrl(data, 0, "leave masked after recovery failure");
 	lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+	data->fifo_running = false;
 	return ret;
 }
 
@@ -811,6 +895,13 @@ static const struct iio_trigger_ops lsm6dsox_trigger_ops = {
 	.validate_device = iio_trigger_validate_own_device,
 };
 
+static int lsm6dsox_buffer_preenable(struct iio_dev *indio_dev)
+{
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+
+	return pm_runtime_resume_and_get(&data->client->dev);
+}
+
 static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 {
 	struct lsm6dsox_data *data = iio_priv(indio_dev);
@@ -847,34 +938,9 @@ static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 		data->hw_timestamp_valid = false;
 		data->fifo_faulted = false;
 
-		ret = lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
+		ret = lsm6dsox_fifo_start_hw(indio_dev);
 		if (ret < 0)
 			goto out;
-
-		ret = lsm6dsox_fifo_set_batching(data, true);
-		if (ret < 0)
-			goto out;
-
-		ret = lsm6dsox_fifo_set_timestamp_batching(data, true);
-		if (ret < 0)
-			goto err_disable_batching;
-
-		ret = lsm6dsox_fifo_program_watermark(data);
-		if (ret < 0)
-			goto err_disable_timestamp;
-
-		ret = lsm6dsox_reset_hw_timestamp(indio_dev);
-		if (ret < 0)
-			goto err_disable_timestamp;
-
-		ret = lsm6dsox_fifo_set_mode(data,
-					     LSM6DSOX_FIFO_MODE_CONTINUOUS);
-		if (ret < 0)
-			goto err_disable_timestamp;
-
-		ret = lsm6dsox_config_int1_fifo(data);
-		if (ret < 0)
-			goto err_bypass;
 
 		data->buffer_enabled = true;
 		dev_info(&data->client->dev,
@@ -882,13 +948,6 @@ static int lsm6dsox_buffer_postenable(struct iio_dev *indio_dev)
 			 data->fifo_watermark, data->fifo_hw_entries,
 			 data->accel_odr, data->fifo_read_chunk);
 		goto out;
-
-err_bypass:
-	lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS);
-err_disable_timestamp:
-	lsm6dsox_fifo_set_timestamp_batching(data, false);
-err_disable_batching:
-	lsm6dsox_fifo_set_batching(data, false);
 	}
 out:
 	mutex_unlock(&data->lock);
@@ -903,15 +962,7 @@ static int lsm6dsox_buffer_predisable(struct iio_dev *indio_dev)
 
 	mutex_lock(&data->lock);
 	if (data->buffer_enabled) {
-		ret = lsm6dsox_disable_int1_fifo(data);
-		if (lsm6dsox_fifo_set_mode(data, LSM6DSOX_FIFO_MODE_BYPASS) < 0 &&
-		    !ret)
-			ret = -EIO;
-		if (lsm6dsox_fifo_set_batching(data, false) < 0 && !ret)
-			ret = -EIO;
-		if (lsm6dsox_fifo_set_timestamp_batching(data, false) < 0 &&
-		    !ret)
-			ret = -EIO;
+		ret = lsm6dsox_fifo_stop_hw(data);
 		/*
 		 * Teardown must not poison the next enable cycle.  The hardware state
 		 * is unknown after an I2C error, so force postenable() to reprogram it.
@@ -948,9 +999,21 @@ static int lsm6dsox_buffer_predisable(struct iio_dev *indio_dev)
 	return 0;
 }
 
+static int lsm6dsox_buffer_postdisable(struct iio_dev *indio_dev)
+{
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	struct device *dev = &data->client->dev;
+
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+	return 0;
+}
+
 static const struct iio_buffer_setup_ops lsm6dsox_buffer_ops = {
+	.preenable = lsm6dsox_buffer_preenable,
 	.postenable = lsm6dsox_buffer_postenable,
 	.predisable = lsm6dsox_buffer_predisable,
+	.postdisable = lsm6dsox_buffer_postdisable,
 };
 
 static int lsm6dsox_soft_reset(struct lsm6dsox_data *data)
@@ -1243,6 +1306,109 @@ rollback:
 	return ret;
 }
 
+static int lsm6dsox_restore_sensor_config(struct lsm6dsox_data *data)
+{
+	const struct lsm6dsox_odr_entry *accel_odr = NULL, *gyro_odr = NULL;
+	const struct lsm6dsox_fs_entry *accel_fs = NULL, *gyro_fs = NULL;
+	unsigned int accel_value, gyro_value;
+	unsigned int value;
+	size_t i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(lsm6dsox_odr_table); i++) {
+		if (lsm6dsox_odr_table[i].hz == data->accel_odr)
+			accel_odr = &lsm6dsox_odr_table[i];
+		if (lsm6dsox_odr_table[i].hz == data->gyro_odr)
+			gyro_odr = &lsm6dsox_odr_table[i];
+	}
+
+	for (i = 0; i < ARRAY_SIZE(lsm6dsox_accel_fs_table); i++)
+		if (lsm6dsox_accel_fs_table[i].scale_nano ==
+		    data->accel_scale_nano)
+			accel_fs = &lsm6dsox_accel_fs_table[i];
+
+	for (i = 0; i < ARRAY_SIZE(lsm6dsox_gyro_fs_table); i++)
+		if (lsm6dsox_gyro_fs_table[i].scale_nano ==
+		    data->gyro_scale_nano)
+			gyro_fs = &lsm6dsox_gyro_fs_table[i];
+
+	if (!accel_odr || !gyro_odr || !accel_fs || !gyro_fs)
+		return -EINVAL;
+
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL3_C,
+				 LSM6DSOX_BDU, LSM6DSOX_BDU);
+	if (ret < 0)
+		return ret;
+
+	accel_value = accel_odr->value | accel_fs->value;
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL1_XL,
+				 LSM6DSOX_ODR_XL_MASK | LSM6DSOX_FS_XL_MASK,
+				 accel_value);
+	if (ret < 0)
+		return ret;
+
+	gyro_value = gyro_odr->value | gyro_fs->value;
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL2_G,
+				 LSM6DSOX_ODR_G_MASK | LSM6DSOX_FS_G_MASK |
+				 LSM6DSOX_FS_125_MASK, gyro_value);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL10_C,
+				 LSM6DSOX_TIMESTAMP_EN, LSM6DSOX_TIMESTAMP_EN);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_CTRL1_XL, &value);
+	if (ret < 0)
+		return ret;
+	if ((value & (LSM6DSOX_ODR_XL_MASK | LSM6DSOX_FS_XL_MASK)) !=
+	    accel_value)
+		return -EIO;
+
+	ret = regmap_read(data->regmap, LSM6DSOX_REG_CTRL2_G, &value);
+	if (ret < 0)
+		return ret;
+	if ((value & (LSM6DSOX_ODR_G_MASK | LSM6DSOX_FS_G_MASK |
+		      LSM6DSOX_FS_125_MASK)) != gyro_value)
+		return -EIO;
+
+	data->timestamp_valid = false;
+	data->hw_timestamp_valid = false;
+	return 0;
+}
+
+static int lsm6dsox_power_down(struct lsm6dsox_data *data)
+{
+	int first_error = 0;
+	int ret;
+
+	if (data->fifo_running) {
+		ret = lsm6dsox_fifo_stop_hw(data);
+		if (ret < 0)
+			first_error = ret;
+	}
+
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL1_XL,
+				 LSM6DSOX_ODR_XL_MASK, 0);
+	if (ret < 0 && !first_error)
+		first_error = ret;
+
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL2_G,
+				 LSM6DSOX_ODR_G_MASK, 0);
+	if (ret < 0 && !first_error)
+		first_error = ret;
+
+	ret = regmap_update_bits(data->regmap, LSM6DSOX_REG_CTRL10_C,
+				 LSM6DSOX_TIMESTAMP_EN, 0);
+	if (ret < 0 && !first_error)
+		first_error = ret;
+
+	data->timestamp_valid = false;
+	data->hw_timestamp_valid = false;
+	return first_error;
+}
+
 static int lsm6dsox_read_xyz(struct lsm6dsox_data *data, u8 start_reg,
 			     s16 *x, s16 *y, s16 *z)
 {
@@ -1278,10 +1444,18 @@ static int lsm6dsox_read_raw(struct iio_dev *indio_dev,
 		if (ret)
 			return ret;
 
+		ret = pm_runtime_resume_and_get(&data->client->dev);
+		if (ret < 0) {
+			iio_device_release_direct_mode(indio_dev);
+			return ret;
+		}
+
 		mutex_lock(&data->lock);
 		ret = regmap_bulk_read(data->regmap, chan->address,
 					       raw, sizeof(raw));
 		mutex_unlock(&data->lock);
+		pm_runtime_mark_last_busy(&data->client->dev);
+		pm_runtime_put_autosuspend(&data->client->dev);
 		iio_device_release_direct_mode(indio_dev);
 		if (ret < 0) {
 			dev_err(&data->client->dev,
@@ -1382,6 +1556,12 @@ static int lsm6dsox_write_raw(struct iio_dev *indio_dev,
 	if (ret)
 		return ret;
 
+	ret = pm_runtime_resume_and_get(&data->client->dev);
+	if (ret < 0) {
+		iio_device_release_direct_mode(indio_dev);
+		return ret;
+	}
+
 	mutex_lock(&data->lock);
 	if (mask == IIO_CHAN_INFO_SCALE) {
 		ret = lsm6dsox_set_full_scale(data, chan->type, val2);
@@ -1406,6 +1586,8 @@ odr_rollback:
 out_unlock:
 	mutex_unlock(&data->lock);
 
+	pm_runtime_mark_last_busy(&data->client->dev);
+	pm_runtime_put_autosuspend(&data->client->dev);
 	iio_device_release_direct_mode(indio_dev);
 
 	return ret;
@@ -1573,6 +1755,131 @@ static const struct iio_info lsm6dsox_iio_info = {
 	.write_raw_get_fmt = lsm6dsox_write_raw_get_fmt,
 	.validate_trigger = lsm6dsox_validate_trigger,
 	.hwfifo_set_watermark = lsm6dsox_hwfifo_set_watermark,
+};
+
+static int __maybe_unused lsm6dsox_runtime_suspend(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	bool restore_fifo;
+	int restore_ret;
+	int ret;
+
+	mutex_lock(&data->lock);
+	restore_fifo = data->fifo_running;
+	if (data->buffer_enabled)
+		atomic64_inc(&data->fifo_discontinuity_count);
+
+	ret = lsm6dsox_power_down(data);
+	if (ret < 0) {
+		restore_ret = lsm6dsox_restore_sensor_config(data);
+		if (!restore_ret && restore_fifo)
+			restore_ret = lsm6dsox_fifo_start_hw(indio_dev);
+		if (restore_ret < 0)
+			dev_err(dev,
+				"failed to restore hardware after suspend error: %d\n",
+				restore_ret);
+	}
+	mutex_unlock(&data->lock);
+
+	if (!ret)
+		dev_dbg(dev, "runtime suspended: accel and gyro powered down\n");
+	return ret;
+}
+
+static int __maybe_unused lsm6dsox_runtime_resume(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	int attempt;
+	int ret;
+
+	mutex_lock(&data->lock);
+	for (attempt = 0; attempt < LSM6DSOX_RESUME_RETRIES; attempt++) {
+		ret = lsm6dsox_restore_sensor_config(data);
+		if (!ret)
+			break;
+		if (attempt + 1 < LSM6DSOX_RESUME_RETRIES)
+			msleep(LSM6DSOX_RESUME_RETRY_DELAY_MS);
+	}
+	if (ret < 0)
+		goto out_power_down;
+
+	msleep(LSM6DSOX_STARTUP_DELAY_MS);
+	if (data->buffer_enabled) {
+		ret = lsm6dsox_fifo_start_hw(indio_dev);
+		if (ret < 0)
+			goto out_power_down;
+	}
+
+	data->fifo_faulted = false;
+	mutex_unlock(&data->lock);
+	dev_dbg(dev, "runtime resumed: cached sensor state restored\n");
+	return 0;
+
+out_power_down:
+	data->fifo_faulted = data->buffer_enabled;
+	lsm6dsox_power_down(data);
+	mutex_unlock(&data->lock);
+	dev_err(dev, "failed to restore hardware after resume: %d\n", ret);
+	return ret;
+}
+
+static int __maybe_unused lsm6dsox_suspend(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	int ret;
+
+	if (data->client->irq > 0) {
+		disable_irq(data->client->irq);
+		data->irq_disabled_for_suspend = true;
+	}
+	if (data->buffer_enabled && indio_dev->pollfunc &&
+	    indio_dev->pollfunc->irq > 0)
+		synchronize_irq(indio_dev->pollfunc->irq);
+
+	ret = pm_runtime_force_suspend(dev);
+	if (ret < 0 && data->irq_disabled_for_suspend) {
+		enable_irq(data->client->irq);
+		data->irq_disabled_for_suspend = false;
+	}
+	if (!ret)
+		dev_info(dev, "system suspended: buffer=%u\n",
+			 data->buffer_enabled);
+
+	return ret;
+}
+
+static int __maybe_unused lsm6dsox_resume(struct device *dev)
+{
+	struct iio_dev *indio_dev = dev_get_drvdata(dev);
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (!ret && pm_runtime_suspended(dev)) {
+		ret = pm_runtime_resume_and_get(dev);
+		if (!ret) {
+			pm_runtime_mark_last_busy(dev);
+			pm_runtime_put_autosuspend(dev);
+		}
+	}
+	if (data->irq_disabled_for_suspend) {
+		enable_irq(data->client->irq);
+		data->irq_disabled_for_suspend = false;
+	}
+	if (!ret)
+		dev_info(dev, "system resumed: buffer=%u fifo=%u\n",
+			 data->buffer_enabled, data->fifo_running);
+
+	return ret;
+}
+
+static const struct dev_pm_ops lsm6dsox_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(lsm6dsox_suspend, lsm6dsox_resume)
+	SET_RUNTIME_PM_OPS(lsm6dsox_runtime_suspend,
+			   lsm6dsox_runtime_resume, NULL)
 };
 
 static int lsm6dsox_probe(struct i2c_client *client)
@@ -1776,13 +2083,39 @@ static int lsm6dsox_probe(struct i2c_client *client)
 		return ret;
 	}
 
+	ret = pm_runtime_set_active(&client->dev);
+	if (ret < 0)
+		return ret;
+
+	pm_runtime_get_noresume(&client->dev);
+	pm_runtime_set_autosuspend_delay(&client->dev,
+					 LSM6DSOX_AUTOSUSPEND_DELAY_MS);
+	pm_runtime_use_autosuspend(&client->dev);
+	pm_runtime_enable(&client->dev);
+	pm_runtime_mark_last_busy(&client->dev);
+	pm_runtime_put_autosuspend(&client->dev);
+
 	dev_info(&client->dev, "IIO device registered\n");
 	return 0;
 }
 
 static void lsm6dsox_remove(struct i2c_client *client)
 {
-	/* devm and the IIO core release the device, buffer and trigger. */
+	struct iio_dev *indio_dev = i2c_get_clientdata(client);
+	struct lsm6dsox_data *data = iio_priv(indio_dev);
+	int ret;
+
+	ret = pm_runtime_resume_and_get(&client->dev);
+	pm_runtime_disable(&client->dev);
+	if (ret < 0)
+		return;
+
+	mutex_lock(&data->lock);
+	ret = lsm6dsox_power_down(data);
+	mutex_unlock(&data->lock);
+	if (ret < 0)
+		dev_warn(&client->dev, "failed to power down on remove: %d\n", ret);
+	pm_runtime_put_noidle(&client->dev);
 }
 
 static const struct of_device_id lsm6dsox_of_match[] = {
@@ -1795,6 +2128,7 @@ static struct i2c_driver lsm6dsox_driver = {
 	.driver = {
 		.name = "my_lsm6dsox",
 		.of_match_table = lsm6dsox_of_match,
+		.pm = &lsm6dsox_pm_ops,
 	},
 	.probe_new = lsm6dsox_probe,
 	.remove = lsm6dsox_remove,
