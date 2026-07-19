@@ -28,6 +28,14 @@ robotics-facing data pipeline.
   parameters, and frame configuration.
 - `docs/regmap-refactor.md`: rationale, migration mapping, and validation for
   the driver register-access refactor.
+- `docs/performance/fifo-watermark-validation.md`: hardware FIFO design,
+  correctness checks, and watermark 1 versus 8 performance measurements.
+- `docs/dynamic-scale-validation.md`: runtime accel/gyro full-scale mappings,
+  IIO sysfs commands, register verification, and ROS 2 validation.
+- `docs/runtime-pm-suspend-validation.md`: runtime autosuspend design, direct
+  access and buffer PM ownership, deep suspend/resume, and board measurements.
+- `docs/driver-code-reading-guide.md`: Chinese architecture overview and a
+  call-chain-based walkthrough of the complete kernel driver.
 
 ## Implemented features
 
@@ -35,13 +43,29 @@ robotics-facing data pipeline.
 - I2C probe with `WHO_AM_I=0x6c` verification.
 - Standard `regmap-i2c` register access with read, write, masked update, and
   bulk-read paths.
-- Software reset, BDU enable, and 104 Hz accel/gyro configuration.
+- Software reset, BDU enable, and coherent 26/52/104/208 Hz accel/gyro ODR
+  configuration through IIO sysfs.
+- Runtime IIO scale configuration for accel +/-2/4/8/16 g and gyro
+  +/-125/250/500/1000/2000 dps, with register verification and rollback.
 - IIO accel and angular velocity channels for X/Y/Z axes.
 - `raw`, `scale`, and `sampling_frequency` IIO attributes.
-- Data-ready INT1 interrupt routed to a threaded IRQ.
-- IIO trigger and triggered buffer support.
+- FIFO-watermark INT1 interrupt with tagged accel/gyro/hardware-timestamp
+  batch reads.
+- IIO trigger and triggered buffer support with a configurable hardware FIFO
+  watermark (default: 4 combined scans).
 - 24-byte buffered scan frame: accel XYZ, gyro XYZ, timestamp.
+- Calibrated 32-bit hardware timestamp ticks with rollover extension,
+  backward/gap detection, and mapping into the selected IIO clock domain.
+- Full FIFO overflow and I2C error recovery, explicit data-discontinuity and
+  unknown-loss counters, FIFO tag-integrity checks, and repeatable buffer
+  enable/disable rollback.
+- Runtime PM with a 2-second autosuspend delay, direct-access reference
+  handling, ODR power-down, and buffer-lifetime PM ownership.
+- Deep system suspend/resume with IRQ synchronization, cached ODR/scale and
+  FIFO restoration, bounded I2C resume retries, and explicit discontinuity
+  reporting.
 - ROS 2 publisher with IIO device auto-detection and launch file support.
+- ROS 2 `/diagnostics` reporting with OK/WARN/ERROR FIFO health states.
 - Parameterized frame ID, stationary gyro-bias correction, and covariance
   loading from a per-board calibration YAML.
 - A manual-start systemd service and one-command IIO-to-ROS validation.
@@ -65,14 +89,37 @@ Observed validation results:
   published `/imu/data` at about `102.5 Hz`.
 - Madgwick filter and rosbag recording were validated on the board.
 - The post-regmap systemd/IIO/ROS validation passed after a clean board reboot.
+- At the same 104 Hz ODR, changing the hardware FIFO watermark from 1 to 8
+  reduced measured IRQs by 88.9% and I2C messages by 74.8% in 5-second tests.
+- The FIFO v2 default watermark 4 delivered about 104 scans/s with 26 IRQ/s;
+  its enlarged burst and read-path cleanup kept the FIFO path to two I2C calls
+  per IRQ.
+- FIFO v3 parsed the LSM6DSOX hardware timestamp tag at all four supported
+  ODRs. A forced overflow was discarded and recovered with an explicit ROS 2
+  WARN diagnostic instead of synthetic samples.
+- A 1,000-message local ROS 2 integration run at 104 Hz/watermark 4 delivered
+  102.811 messages/s with 51.998 ms mean, 65.325 ms P95, and 68.652 ms maximum
+  sample-to-subscriber latency. The publisher consumed 0.599% of one CPU in a
+  steady-state 15-second window, with all FIFO and timestamp error counters at
+  zero. Timestamp spacing was a stable 9.758 ms; absolute startup alignment is
+  documented as a remaining measurement limitation.
+- All four accel and five gyro scales were written and verified against
+  `CTRL1_XL`/`CTRL2_G`; invalid and active-buffer writes were rejected without
+  changing the previous scale.
+- Runtime idle powered down accel, gyro, and timestamp registers; raw access
+  woke them and buffer enable held a PM reference until buffer disable.
+- Deep suspend/resume passed with the buffer both disabled and enabled. The
+  active test restored 52 Hz, maximum accel/gyro ranges, watermark 4, FIFO and
+  INT1, then continued streaming without overflow, backward timestamps, or
+  unreported discontinuity.
 
 ## v1.0.0 Release Scope
 
 The v1.0.0 release covers the complete hardware-to-ROS pipeline:
 
 ```text
-Device Tree → I2C probe/regmap → INT1 IRQ → IIO triggered buffer
-           → /dev/iio:deviceX → ROS 2 Imu → systemd service
+Device Tree → I2C probe/regmap → FIFO watermark IRQ → IIO buffer
+           → /dev/iio:deviceX → ROS 2 Imu + diagnostics → systemd service
 ```
 
 Before a deployment or release, run this final board-side acceptance check:
@@ -125,10 +172,26 @@ ros2 launch lsm6dsox_ros imu.launch.py
 ./scripts/disable_lsm6dsox_buffer.sh
 ```
 
-Override the default 128-frame kernel buffer if needed:
+Override the default 128-frame kernel buffer or the default 4-scan hardware
+FIFO watermark if needed:
 
 ```sh
 BUFFER_LENGTH=256 ./scripts/enable_lsm6dsox_buffer.sh
+FIFO_WATERMARK=4 ./scripts/enable_lsm6dsox_buffer.sh
+```
+
+The watermark trades batch latency for bus and interrupt overhead. At 104 Hz,
+the default watermark 4 represents roughly 38.5 ms of samples per full batch;
+use `FIFO_WATERMARK=2` when lower delivery latency matters more than IRQ rate.
+
+Set sensor full scale while the buffer is disabled. IIO exposes SI scale per
+raw LSB, so use a value listed by the corresponding `_available` attribute:
+
+```sh
+cat /sys/bus/iio/devices/iio:device1/in_accel_scale_available
+cat /sys/bus/iio/devices/iio:device1/in_anglvel_scale_available
+echo 0.004785645 | sudo tee \
+  /sys/bus/iio/devices/iio:device1/in_accel_scale
 ```
 
 For a manually controlled service that restarts the ROS 2 node after failures,
@@ -143,8 +206,13 @@ sudo ./IIO-raw/iio_buffer_reader /dev/iio:device1 20
 ## Current limitations
 
 - The driver is still an out-of-tree learning driver.
-- No hardware FIFO or FIFO watermark support.
-- No runtime PM, suspend/resume handling, or regcache synchronization policy.
-- Accelerometer six-face scale/bias and installation-axis calibration are not
-  implemented; stationary accel means are recorded but gravity is not removed.
+- The board image's `iio-sensor-proxy` periodically reads raw channels and can
+  keep postponing autosuspend; stop it when measuring true idle power.
+- Hardware timestamp rollover extension is implemented but still needs a
+  continuous 30-hour rollover validation run.
+- Forced FIFO overflow is covered; I2C fault injection still needs dedicated
+  adapter-level testing.
+- Accelerometer six-face bias calibration and installation-axis calibration
+  are not implemented; stationary accel means are recorded but gravity is not
+  removed.
 - The systemd service is not enabled at boot by default.

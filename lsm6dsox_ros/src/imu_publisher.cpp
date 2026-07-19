@@ -1,20 +1,26 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 #include <glob.h>
 #include <memory>
 #include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
+#include "diagnostic_msgs/msg/diagnostic_status.hpp"
+#include "diagnostic_msgs/msg/key_value.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 
 class Lsm6dsoxImuPublisher : public rclcpp::Node {
@@ -44,6 +50,12 @@ public:
 
     publisher_ = create_publisher<sensor_msgs::msg::Imu>(
         "/imu/data", rclcpp::SensorDataQoS());
+    diagnostic_publisher_ =
+        create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+            "/diagnostics", 10);
+    diagnostic_timer_ = create_wall_timer(
+        std::chrono::seconds(1),
+        std::bind(&Lsm6dsoxImuPublisher::publish_diagnostics, this));
 
     device_fd_ = ::open(device_node_.c_str(), O_RDONLY | O_CLOEXEC);
     if (device_fd_ < 0) {
@@ -113,6 +125,22 @@ private:
     }
 
     double value = 0.0;
+    file >> value;
+    if (!file.good() && !file.eof()) {
+      throw std::runtime_error("failed to read " + path);
+    }
+
+    return value;
+  }
+
+  static int64_t read_integer(const std::string &path) {
+    std::ifstream file(path);
+    int64_t value = 0;
+
+    if (!file.is_open()) {
+      throw std::runtime_error("failed to open " + path);
+    }
+
     file >> value;
     if (!file.good() && !file.eof()) {
       throw std::runtime_error("failed to read " + path);
@@ -265,6 +293,85 @@ private:
     }
   }
 
+  void publish_diagnostics() {
+    diagnostic_msgs::msg::DiagnosticArray array;
+    diagnostic_msgs::msg::DiagnosticStatus status;
+
+    array.header.stamp = now();
+    status.name = "lsm6dsox/FIFO";
+    status.hardware_id = device_path_;
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    status.message = "FIFO healthy";
+
+    const auto add_value = [&status](const std::string &name, int64_t value) {
+      diagnostic_msgs::msg::KeyValue item;
+      item.key = name;
+      item.value = std::to_string(value);
+      status.values.push_back(std::move(item));
+    };
+
+    try {
+      const std::string root = device_path_ + "/buffer/";
+      const int64_t faulted = read_integer(root + "hwfifo_faulted");
+      const int64_t overflows =
+          read_integer(root + "hwfifo_overflow_count");
+      const int64_t i2c_errors =
+          read_integer(root + "hwfifo_i2c_error_count");
+      const int64_t tag_errors =
+          read_integer(root + "hwfifo_tag_error_count");
+      const int64_t dropped =
+          read_integer(root + "hwfifo_dropped_scan_count");
+      const int64_t unknown_losses =
+          read_integer(root + "hwfifo_unknown_loss_count");
+      const int64_t discontinuities =
+          read_integer(root + "hwfifo_discontinuity_count");
+      const int64_t recoveries =
+          read_integer(root + "hwfifo_recovery_count");
+      const int64_t recovery_failures =
+          read_integer(root + "hwfifo_recovery_failure_count");
+      const int64_t timestamp_backwards =
+          read_integer(root + "hwfifo_timestamp_backward_count");
+      const int64_t timestamp_gaps =
+          read_integer(root + "hwfifo_timestamp_gap_count");
+      const int64_t timestamp_rollovers =
+          read_integer(root + "hwfifo_timestamp_rollover_count");
+
+      add_value("faulted", faulted);
+      add_value("overflows", overflows);
+      add_value("i2c_errors", i2c_errors);
+      add_value("tag_errors", tag_errors);
+      add_value("dropped_scans", dropped);
+      add_value("unknown_loss_events", unknown_losses);
+      add_value("discontinuities", discontinuities);
+      add_value("recoveries", recoveries);
+      add_value("recovery_failures", recovery_failures);
+      add_value("timestamp_backwards", timestamp_backwards);
+      add_value("timestamp_gaps", timestamp_gaps);
+      add_value("timestamp_rollovers", timestamp_rollovers);
+      add_value("timestamp_tick_ns",
+                read_integer(root + "hwfifo_timestamp_tick_ns"));
+      add_value("watermark",
+                read_integer(root + "hwfifo_watermark"));
+
+      if (faulted || recovery_failures) {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+        status.message = "FIFO recovery failed; interrupt remains masked";
+      } else if (overflows || i2c_errors || tag_errors || dropped ||
+                 unknown_losses || discontinuities || timestamp_backwards ||
+                 timestamp_gaps) {
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        status.message = "FIFO recovered from a data discontinuity";
+      }
+    } catch (const std::exception &error) {
+      status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+      status.message = std::string("failed to read FIFO diagnostics: ") +
+                       error.what();
+    }
+
+    array.status.push_back(std::move(status));
+    diagnostic_publisher_->publish(array);
+  }
+
   void publish_frame(const std::array<uint8_t, kFrameSize> &frame) {
     const int16_t accel_x = read_le16(frame.data() + 0);
     const int16_t accel_y = read_le16(frame.data() + 2);
@@ -311,6 +418,9 @@ private:
   std::atomic<bool> running_{false};
   std::thread worker_thread_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr publisher_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr
+      diagnostic_publisher_;
+  rclcpp::TimerBase::SharedPtr diagnostic_timer_;
 };
 
 int main(int argc, char **argv) {
