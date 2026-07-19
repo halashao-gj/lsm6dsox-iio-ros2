@@ -169,8 +169,69 @@ Twenty repeated hardware-timestamp FIFO enable/disable cycles completed with
 the buffer disabled. A watermark of 171 was rejected against the dynamic
 maximum of 170, and the board was restored to coherent 104 Hz accel/gyro ODR.
 
+## ROS 2 end-to-end latency and CPU
+
+A final integration run used the released FIFO v3 path at 104 Hz and watermark
+4. The C++ publisher and the Python subscriber both ran on the LubanCat, and the
+IIO `current_timestamp_clock` was `realtime`. Therefore the latency below is the
+difference between the hardware-derived sample timestamp in the ROS header and
+the subscriber callback's system-clock time. It includes FIFO batching, IRQ and
+I2C handling, the IIO reader, ROS publication, and local scheduling; it does not
+include network transport.
+
+The reproducible subscriber is `scripts/measure_imu_latency.py`. It collected
+1,000 messages over 9.717 seconds in the final run:
+
+| Metric | Result |
+|---|---:|
+| Receive rate | 102.811 Hz |
+| Minimum latency | 34.236 ms |
+| Mean latency | 51.998 ms |
+| Median latency | 51.890 ms |
+| Latency standard deviation | 8.655 ms |
+| Latency P95 | 65.325 ms |
+| Latency P99 | 66.624 ms |
+| Maximum latency | 68.652 ms |
+| Timestamp delta (min/mean/max) | 9.758 / 9.758 / 9.758 ms |
+| Duplicate/backward timestamps | 0 / 0 |
+
+During a separate 12.024-second steady-state window, IRQ 108 increased by 308,
+or about 25.6 IRQ/s. This agrees with the expected `104 / 4 = 26 IRQ/s` while
+allowing for the sensor clock and measurement-window boundaries. The publisher
+used 9 scheduler ticks over a separate 15.013-second steady-state window
+(`CLK_TCK=100`), equivalent to 0.599% of one CPU. This process-only value does
+not include the kernel IRQ thread or unrelated ROS processes.
+
+All FIFO overflow, I2C error, tag error, dropped-scan, unknown-loss,
+discontinuity, recovery-failure, timestamp-backward, and timestamp-gap counters
+were zero. The configured ODR remained 104 Hz and the watermark remained 4;
+after the measurement the service was stopped and the IIO buffer verified as
+disabled.
+
+The relative timestamp spacing was repeatable, but one earlier buffer start
+showed a lower fixed absolute offset (24.005 ms mean and 40.124 ms maximum).
+Subsequent restarts measured approximately 52--55 ms mean latency. This does
+not affect timestamp ordering or the measured 9.758 ms sample interval, but it
+means the absolute latency figures above are observations rather than a proven
+worst-case bound. Hardware-tick-to-system-clock startup alignment remains an
+explicit follow-up item.
+
+To repeat the ROS timing measurement on the board:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+python3 scripts/measure_imu_latency.py --samples 1000 --timeout 20
+```
+
+The configured ODR is nominal. Do not label the difference between 104 Hz and
+the short-window receive-rate estimate as frame loss by itself; use the driver
+loss/error counters and timestamp continuity checks as well.
+
 ## Remaining work
 
+- Remove the startup-dependent fixed offset in the hardware-tick to system-clock
+  reference, then establish a repeatable worst-case end-to-end latency bound.
 - Measure IRQ-thread CPU usage, scheduling latency and power at watermarks
   1, 2, 4, 8 and 16.
 - Add adapter-level I2C fault injection and verify the recovery-failure ERROR

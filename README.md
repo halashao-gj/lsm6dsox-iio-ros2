@@ -97,6 +97,12 @@ Observed validation results:
 - FIFO v3 parsed the LSM6DSOX hardware timestamp tag at all four supported
   ODRs. A forced overflow was discarded and recovered with an explicit ROS 2
   WARN diagnostic instead of synthetic samples.
+- A 1,000-message local ROS 2 integration run at 104 Hz/watermark 4 delivered
+  102.811 messages/s with 51.998 ms mean, 65.325 ms P95, and 68.652 ms maximum
+  sample-to-subscriber latency. The publisher consumed 0.599% of one CPU in a
+  steady-state 15-second window, with all FIFO and timestamp error counters at
+  zero. Timestamp spacing was a stable 9.758 ms; absolute startup alignment is
+  documented as a remaining measurement limitation.
 - All four accel and five gyro scales were written and verified against
   `CTRL1_XL`/`CTRL2_G`; invalid and active-buffer writes were rejected without
   changing the previous scale.
